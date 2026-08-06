@@ -1,0 +1,60 @@
+name: Build Global Land Layer
+
+# Builds one world-covering "land" PMTiles layer by pulling the `water` layer
+# from OpenFreeMap's latest published planet PMTiles archive and inverting
+# each tile (the "land" profile, see tilealchemist/profiles/land.py), then
+# publishes it. See README.md ("Method", "Fetching", "Parallelism") and
+# docs/ARCHITECTURE.md for why it's structured this way; the actual build
+# and publish steps (_pipeline.yml, _publish-release.yml, _publish-b2.yml)
+# are shared with build-cropped-waterways.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_zoom:
+        description: "Max zoom for the land layer (default: 14)."
+        required: false
+        default: "14"
+  schedule:
+    - cron: "0 0 1 * *"
+
+jobs:
+  build:
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      profile: land
+      output_basename: land
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+      attribution: '<a href="https://github.com/foxandfeature/tilealchemist">TileAlchemist</a> &middot; <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+
+  publish-release:
+    needs: build
+    uses: ./.github/workflows/_publish-release.yml
+    permissions:
+      contents: write
+    with:
+      pmtiles_artifact: ${{ needs.build.outputs.pmtiles_artifact }}
+      output_basename: land
+      tag: land-latest
+      title: "Global land layer"
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+
+  # Gated by the `b2-publish` GitHub Environment (Settings > Environments):
+  # you as required reviewer, and B2_APPLICATION_KEY_ID /
+  # B2_APPLICATION_KEY / B2_BUCKET_NAME scoped to that environment, not the
+  # repo. No run, scheduled or manual, decrypts those secrets without your
+  # explicit approval in the Actions UI first. Scope the application key
+  # itself in the B2 dashboard to just this one bucket, so a leaked key
+  # still can't read or touch anything else in the account. The key needs
+  # writeFiles (upload) and deleteFiles (prune old versions), plus
+  # listFiles: the prune step calls `b2 ls --versions` to find the file
+  # IDs of prior uploads before it can delete them, so a write-only key
+  # fails with "unauthorized" partway through. See _publish-b2.yml for why
+  # this reusable workflow, unlike _pipeline.yml/_publish-release.yml, is
+  # not meant to be called cross-repo.
+  publish-b2:
+    needs: build
+    uses: ./.github/workflows/_publish-b2.yml
+    with:
+      pmtiles_artifact: ${{ needs.build.outputs.pmtiles_artifact }}
+      output_basename: land

@@ -1,0 +1,35 @@
+{
+  "version": 8,
+  "name": "TileAlchemist cropped-waterways example",
+  "sources": {
+    "land": {
+      "type": "vector",
+      "url": "pmtiles://https://f003.backblazeb2.com/file/tilealchemist/land.pmtiles"
+    },
+    "waterways": {
+      "type": "vector",
+      "url": "pmtiles://https://f003.backblazeb2.com/file/tilealchemist/waterways.pmtiles"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": { "background-color": "#0b1a2b" }
+    },
+    {
+      "id": "land",
+      "type": "fill",
+      "source": "land",
+      "source-layer": "land",
+      "paint": { "fill-color": "#dcd3c0" }
+    },
+    {
+      "id": "waterways",
+      "type": "line",
+      "source": "waterways",
+      "source-layer": "waterways",
+      "paint": { "line-color": "#4a90d9", "line-width": 1.2 }
+    }
+  ]
+}

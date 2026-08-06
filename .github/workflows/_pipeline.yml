@@ -1,0 +1,206 @@
+name: TileAlchemist pipeline (reusable)
+
+# Builds one profile's world-covering PMTiles layer: prepare-shards walks
+# the source archive once, build-shards runs the profile's per-tile
+# transform across WORKER_COUNT parallel workers, merge joins the shards
+# into one .pmtiles file. Deliberately does NOT publish anywhere (no
+# GitHub Release, no B2 upload): that's the calling workflow's job, so its
+# `environment:`/secrets resolve against the caller's own repository, not
+# this one (see docs/ARCHITECTURE.md "Publishing"). Callers: build-land.yml,
+# build-cropped-waterways.yml, or a third-party repo's own workflow via
+# `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: 'tilealchemist.profiles entry point name to apply, e.g. "land" or "cropped-waterways".'
+        required: true
+        type: string
+      profile_package:
+        description: 'Optional pip spec (PyPI name, or "git+https://...") installed before resolving --profile, for a profile not built into this repo.'
+        required: false
+        type: string
+        default: ""
+      source:
+        description: 'tilealchemist.sources entry to resolve the PMTiles archive from.'
+        required: false
+        type: string
+        default: "openfreemap"
+      source_url:
+        description: 'PMTiles URL to use; required when source is "static-url".'
+        required: false
+        type: string
+        default: ""
+      max_zoom:
+        required: false
+        type: string
+        default: "14"
+      output_basename:
+        description: 'Base name for the output .pmtiles file and its artifact, e.g. "land" or "waterways".'
+        required: true
+        type: string
+      attribution:
+        description: "HTML attribution string embedded in the merged PMTiles metadata via tile-join --attribution."
+        required: true
+        type: string
+    outputs:
+      pmtiles_artifact:
+        description: "Name of the workflow artifact holding the merged .pmtiles file."
+        value: ${{ jobs.merge.outputs.pmtiles_artifact }}
+
+env:
+  WORKER_COUNT: 256
+
+jobs:
+  prepare-shards:
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.gen.outputs.workers }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tilealchemist
+        run: pip install .
+
+      - name: Walk archive directory and partition into per-worker manifests
+        env:
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+          SOURCE: ${{ inputs.source }}
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          ARGS=(--worker-count "$WORKER_COUNT" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
+          if [ -n "$SOURCE_URL" ]; then
+            ARGS+=(--source-url "$SOURCE_URL")
+          fi
+          tilealchemist-prepare-shards "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-shard-manifests
+          path: manifests
+
+      - id: gen
+        run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+  build-shards:
+    needs: prepare-shards
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare-shards.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tilealchemist
+        env:
+          PROFILE_PACKAGE: ${{ inputs.profile_package }}
+        run: |
+          pip install .
+          if [ -n "$PROFILE_PACKAGE" ]; then
+            pip install "$PROFILE_PACKAGE"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-shard-manifests
+          path: manifests
+
+      - name: Build this worker's tile shard
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          WORKER_ID=$(printf '%03d' ${{ matrix.worker }})
+          tilealchemist-build-shard \
+            --worker-index ${{ matrix.worker }} \
+            --profile "$PROFILE" \
+            --manifest "manifests/worker-${WORKER_ID}.bin" \
+            --source manifests/source.json \
+            --out "${OUTPUT_BASENAME}-shard-${{ matrix.worker }}.mbtiles"
+
+      # A worker's whole slice can legitimately produce nothing (e.g. an
+      # all-ocean slice for the land profile, or a slice with no waterway
+      # features at all), so an empty output here is expected, not a
+      # failure.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.output_basename }}-shard-${{ matrix.worker }}
+          path: ${{ inputs.output_basename }}-shard-${{ matrix.worker }}.mbtiles
+          if-no-files-found: ignore
+
+  merge:
+    needs: build-shards
+    runs-on: ubuntu-latest
+    outputs:
+      pmtiles_artifact: ${{ steps.artifact-name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.output_basename }}-shard-*
+          path: shards
+          merge-multiple: true
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tippecanoe || {
+            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+            make -C /tmp/tippecanoe -j"$(nproc)"
+            sudo make -C /tmp/tippecanoe install
+          }
+
+      # tile-join reports progress as a `z/x/y` line rewritten in place with
+      # \r; throttled through tilealchemist/throttle_progress.sh for the same
+      # reason as the worker progress logs (see README); everything else
+      # (warnings, errors) passes through immediately. stdbuf -oL is needed
+      # because tr otherwise fully buffers its output once it's writing to
+      # a pipe instead of a terminal, which would defeat the throttling by
+      # delivering every line in one burst at the end instead of live.
+      - name: Merge shards into the final layer
+        env:
+          ATTRIBUTION: ${{ inputs.attribution }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          tile-join --no-tile-size-limit \
+            --attribution="$ATTRIBUTION" \
+            -o "${OUTPUT_BASENAME}.pmtiles" shards/*.mbtiles 2>&1 \
+            | stdbuf -oL tr '\r' '\n' \
+            | tilealchemist/throttle_progress.sh 60 '^[0-9]+/[0-9]+/[0-9]+[[:space:]]*$'
+
+      - name: Summarize
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          SHARD_COUNT=$(find shards -name '*.mbtiles' | wc -l | tr -d ' ')
+          SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
+          {
+            echo "### ${OUTPUT_BASENAME} layer"
+            echo "- profile: ${{ inputs.profile }}"
+            echo "- max_zoom: ${{ inputs.max_zoom }}"
+            echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
+            echo "- output size: $SIZE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - id: artifact-name
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: echo "name=${OUTPUT_BASENAME}-pmtiles" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-pmtiles
+          path: ${{ inputs.output_basename }}.pmtiles

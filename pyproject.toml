@@ -1,0 +1,34 @@
+[project]
+name = "tilealchemist"
+version = "0.1.0"
+description = "Generate global PMTiles layers from OpenStreetMap-derived PMTiles sources via pluggable per-tile processing profiles."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "pmtiles",
+    "requests",
+    "mapbox-vector-tile",
+    "shapely",
+]
+
+[project.urls]
+Repository = "https://github.com/foxandfeature/tilealchemist"
+
+[project.scripts]
+tilealchemist-prepare-shards = "tilealchemist.prepare_shards:main"
+tilealchemist-build-shard = "tilealchemist.build_shard:main"
+
+# The "profile SDK" other packages plug into: TileAlchemist's own profiles
+# are discovered through this exact same entry-point group as any external
+# package would use for theirs (see tilealchemist/profiles/__init__.py).
+[project.entry-points."tilealchemist.profiles"]
+land = "tilealchemist.profiles.land:LandProfile"
+cropped-waterways = "tilealchemist.profiles.cropped_waterways:CroppedWaterwaysProfile"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tilealchemist*"]

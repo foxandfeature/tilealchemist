@@ -1,0 +1,54 @@
+name: Build Cropped Waterways Layer
+
+# Builds one world-covering "waterways" PMTiles layer: OpenFreeMap's
+# `waterway` line layer, cropped to just the portions that don't overlap
+# real water polygons (the "cropped-waterways" profile, see
+# tilealchemist/profiles/cropped_waterways.py). Meant to sit alongside the
+# land layer (build-land.yml) for a style where land replaces the water
+# layer as the base: an un-cropped waterway line would otherwise visually
+# clash with the water it runs through. Runs fully independently of
+# build-land.yml (own schedule, own prepare-shards walk), see
+# docs/ARCHITECTURE.md. The actual build and publish steps (_pipeline.yml,
+# _publish-release.yml, _publish-b2.yml) are shared with build-land.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_zoom:
+        description: "Max zoom for the waterways layer (default: 14)."
+        required: false
+        default: "14"
+  schedule:
+    - cron: "0 0 2 * *"
+
+jobs:
+  build:
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      profile: cropped-waterways
+      output_basename: waterways
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+      attribution: '<a href="https://github.com/foxandfeature/tilealchemist">TileAlchemist</a> &middot; <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+
+  publish-release:
+    needs: build
+    uses: ./.github/workflows/_publish-release.yml
+    permissions:
+      contents: write
+    with:
+      pmtiles_artifact: ${{ needs.build.outputs.pmtiles_artifact }}
+      output_basename: waterways
+      tag: waterways-latest
+      title: "Global cropped waterways layer"
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+
+  # Same b2-publish Environment/required-reviewer gate as build-land.yml's
+  # publish-b2 job; uploads to a different object key in the same bucket.
+  # See _publish-b2.yml for why this reusable workflow, unlike
+  # _pipeline.yml/_publish-release.yml, is not meant to be called cross-repo.
+  publish-b2:
+    needs: build
+    uses: ./.github/workflows/_publish-b2.yml
+    with:
+      pmtiles_artifact: ${{ needs.build.outputs.pmtiles_artifact }}
+      output_basename: waterways

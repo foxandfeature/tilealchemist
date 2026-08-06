@@ -1,0 +1,76 @@
+name: Publish to Backblaze B2 (reusable, repo-internal)
+
+# Downloads a merged .pmtiles artifact from a _pipeline.yml run and mirrors
+# it to Backblaze B2, gated behind the b2-publish GitHub Environment.
+#
+# Unlike _pipeline.yml and _publish-release.yml, this workflow is NOT meant
+# to be called cross-repo, and must not be advertised as such (see README's
+# "Adding a profile"). A job's `environment:` (and that environment's
+# secrets) inside a reusable workflow resolves against the repository that
+# owns the *workflow file*, not the caller's. That's harmless here only
+# because both callers (build-land.yml, build-cropped-waterways.yml) live
+# in this same repository: "the workflow file's own repo" and "the
+# caller's repo" are the same repo either way, so this is a plain
+# same-repo DRY refactor, not a cross-repo capability. If a third-party
+# repo ever called this file directly, its job would resolve against
+# *this* repo's own `b2-publish` environment and B2 credentials instead of
+# its own, exactly the credential-leak shape _pipeline.yml avoids by
+# staying publish-free.
+
+on:
+  workflow_call:
+    inputs:
+      pmtiles_artifact:
+        description: "Workflow artifact name holding the merged .pmtiles file (a _pipeline.yml run's pmtiles_artifact output)."
+        required: true
+        type: string
+      output_basename:
+        description: 'Base filename inside that artifact, and the B2 object key it is uploaded under, e.g. "land" for land.pmtiles.'
+        required: true
+        type: string
+
+jobs:
+  publish-b2:
+    runs-on: ubuntu-latest
+    environment: b2-publish
+    steps:
+      - name: Download the merged layer
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.pmtiles_artifact }}
+
+      - name: Install B2 CLI
+        run: pip install "b2>=4,<5"
+
+      - name: Upload to Backblaze B2
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          FILE="${OUTPUT_BASENAME}.pmtiles"
+          # `b2 account authorize` prints the full account_info JSON on
+          # success, including the raw applicationKey and a live
+          # accountAuthToken, via `enforce_output=True` in the CLI, which
+          # bypasses --quiet (there's no progress bar here to suppress
+          # anyway, since this command doesn't transfer a file). GitHub's
+          # secret masking only redacts exact literal matches of declared
+          # secrets, so the derived accountAuthToken leaks into the log
+          # unless we discard stdout here ourselves. Errors still surface
+          # via stderr and the exit code.
+          b2 account authorize "$B2_APPLICATION_KEY_ID" "$B2_APPLICATION_KEY" >/dev/null
+          b2 file upload "$B2_BUCKET_NAME" "$FILE" "$FILE"
+
+          # `b2 file upload` uploads a new version without hiding the one it
+          # replaces, so the bucket's "keep only last version" lifecycle rule
+          # (which only prunes versions that are already hidden) never gets a
+          # chance to run and old versions pile up forever. Prune manually,
+          # after the new version is live, so the public URL never 404s.
+          old_file_ids=$(
+            b2 ls --json --versions "b2://$B2_BUCKET_NAME/$FILE" \
+              | jq -r 'sort_by(.uploadTimestamp) | .[:-1][].fileId'
+          )
+          for file_id in $old_file_ids; do
+            b2 rm "b2id://$file_id"
+          done
