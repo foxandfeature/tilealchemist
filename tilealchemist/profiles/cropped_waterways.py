@@ -54,12 +54,25 @@ class CroppedWaterwaysProfile(Profile):
         extent = waterway.extent
         surface = self.schema.surface_water(decoded)
         union = water.union_polygons(surface.polygons) if surface is not None else None
+        if union is not None:
+            # grid_size= on difference() alone isn't enough here: unlike
+            # land's polygon-polygon case, GEOS's precision-reducing overlay
+            # for a *line* against a polygon can still throw a
+            # TopologyException ("side location conflict") on real-world OSM
+            # water geometry with near-coincident points (seen on build
+            # 20260802_080001_pt). Snapping the union onto the output grid
+            # ourselves first, the same topology-aware way land.py already
+            # relies on, removes those near-duplicate points before the
+            # overlay ever runs instead of hoping the overlay survives them.
+            union = shapely.set_precision(union, water.OUTPUT_GRID_SIZE, mode="valid_output")
 
         features = []
         for feature in waterway.features:
             geometry = feature["geometry"]
-            cropped = geometry.difference(union, grid_size=water.OUTPUT_GRID_SIZE) if union is not None else geometry
-            cropped = _line_components(cropped)
+            if union is not None:
+                geometry = shapely.set_precision(geometry, water.OUTPUT_GRID_SIZE, mode="valid_output")
+                geometry = geometry.difference(union, grid_size=water.OUTPUT_GRID_SIZE)
+            cropped = _line_components(geometry)
             cropped = shapely.set_precision(cropped, water.OUTPUT_GRID_SIZE, mode="valid_output")
             if cropped.is_empty:
                 continue
