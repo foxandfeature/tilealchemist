@@ -40,10 +40,10 @@ jobs:
       max_zoom: ${{ inputs.max_zoom || '14' }}
 
   # Gated by the `b2-publish` GitHub Environment (Settings > Environments):
-  # you as required reviewer, and B2_APPLICATION_KEY_ID /
-  # B2_APPLICATION_KEY / B2_BUCKET_NAME scoped to that environment, not the
-  # repo. No run, scheduled or manual, decrypts those secrets without your
-  # explicit approval in the Actions UI first. Scope the application key
+  # you as required reviewer, and B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY
+  # secrets plus a B2_BUCKET_NAME variable, all scoped to that environment,
+  # not the repo. No run, scheduled or manual, decrypts those secrets without
+  # your explicit approval in the Actions UI first. Scope the application key
   # itself in the B2 dashboard to just this one bucket, so a leaked key
   # still can't read or touch anything else in the account. The key needs
   # writeFiles (upload) and deleteFiles (prune old versions), plus

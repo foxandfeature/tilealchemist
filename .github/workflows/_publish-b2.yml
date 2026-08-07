@@ -46,7 +46,7 @@ jobs:
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_BUCKET_NAME: ${{ vars.B2_BUCKET_NAME }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
         run: |
           FILE="${OUTPUT_BASENAME}.pmtiles"
