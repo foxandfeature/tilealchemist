@@ -6,9 +6,9 @@ river/stream stroke would visibly double up with the water polygon it
 already runs through. See docs/EXAMPLE_PROFILES.md for the full rationale.
 """
 import shapely
-from shapely.geometry import GeometryCollection, LineString, MultiLineString
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, shape
 
-from tilealchemist import mvt, water
+from tilealchemist import water
 from tilealchemist.profiles.base import Profile
 
 
@@ -36,6 +36,9 @@ class CroppedWaterwaysProfile(Profile):
     name = "cropped-waterways"
     output_layer_name = "waterways"
     mbtiles_name = "waterways"
+    compatible_schemas = None  # only calls TileSchema's universal API
+                                # (surface_water/waterway_lines/waterway_fields/
+                                # default_buffer_pixels/tile_size_pixels)
 
     def __init__(self, schema):
         self.schema = schema
@@ -43,17 +46,17 @@ class CroppedWaterwaysProfile(Profile):
     def vector_layers_json(self):
         return [{"id": self.output_layer_name, "fields": self.schema.waterway_fields()}]
 
-    def transform_tile_bytes(self, data):
-        """Decode one tile's waterway layer and return gzipped MVT bytes for
-        the cropped lines, or None if the tile has no waterway features at
-        all (skipped, same as a missing tile in any vector tileset)."""
-        decoded = mvt.decode_tile(data)
-        waterway = self.schema.waterway_lines(decoded)
+    def transform_layer(self, decoded_tile):
+        """Decode one tile's waterway layer and return (features, extent)
+        for the cropped lines, or None if the tile has no waterway features
+        at all (skipped, same as a missing tile in any vector tileset)."""
+        waterway = self.schema.waterway_lines(decoded_tile)
         if waterway is None:
             return None
         extent = waterway.extent
-        surface = self.schema.surface_water(decoded)
-        union = water.union_polygons(surface.polygons) if surface is not None else None
+        surface = self.schema.surface_water(decoded_tile)
+        polygons = [shape(geometry) for geometry in surface.polygons] if surface is not None else []
+        union = water.union_polygons(polygons)
         if union is not None:
             # grid_size= on difference() alone isn't enough here: unlike
             # land's polygon-polygon case, GEOS's precision-reducing overlay
@@ -68,7 +71,7 @@ class CroppedWaterwaysProfile(Profile):
 
         features = []
         for feature in waterway.features:
-            geometry = feature["geometry"]
+            geometry = shape(feature["geometry"])
             if union is not None:
                 geometry = shapely.set_precision(geometry, water.OUTPUT_GRID_SIZE, mode="valid_output")
                 geometry = geometry.difference(union, grid_size=water.OUTPUT_GRID_SIZE)
@@ -81,7 +84,7 @@ class CroppedWaterwaysProfile(Profile):
         if not features:
             return None
 
-        return mvt.encode_tile(self.output_layer_name, features, extent)
+        return features, extent
 
     def gap_tile_bytes(self, zoom, tile_column, tile_row):
         """A gap tile means the source archive had nothing at all for this

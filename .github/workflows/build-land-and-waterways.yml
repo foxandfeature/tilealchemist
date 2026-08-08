@@ -1,0 +1,70 @@
+name: Build Global Land + Cropped Waterways Layers
+
+# Builds both the "land" and "cropped-waterways" world-covering PMTiles
+# layers together via _pipeline.yml (profile/output_basename passed as
+# comma-separated lists), sharing one prepare-shards walk and one fetch per
+# worker across both profiles instead of each having its own independent
+# run (former build-land.yml / build-cropped-waterways.yml each re-fetched
+# the same OpenFreeMap source tile bytes separately). See
+# docs/ARCHITECTURE.md "Fetching"/"Publishing".
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_zoom:
+        description: "Max zoom for both layers (default: 14)."
+        required: false
+        default: "14"
+  schedule:
+    - cron: "0 0 1 * *"
+
+jobs:
+  build:
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      profile: land,cropped-waterways
+      output_basename: land,waterways
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+      attribution: '<a href="https://github.com/foxandfeature/tilealchemist">TileAlchemist</a> &middot; <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+
+  publish-release-land:
+    needs: build
+    uses: ./.github/workflows/_publish-release.yml
+    permissions:
+      contents: write
+    with:
+      pmtiles_artifact: land-pmtiles
+      output_basename: land
+      tag: land-latest
+      title: "Global land layer"
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+
+  # Gated by the `b2-publish` GitHub Environment (see _publish-b2.yml for
+  # the full rationale) - same as both former workflows.
+  publish-b2-land:
+    needs: build
+    uses: ./.github/workflows/_publish-b2.yml
+    secrets: inherit
+    with:
+      pmtiles_artifact: land-pmtiles
+      output_basename: land
+
+  publish-release-waterways:
+    needs: build
+    uses: ./.github/workflows/_publish-release.yml
+    permissions:
+      contents: write
+    with:
+      pmtiles_artifact: waterways-pmtiles
+      output_basename: waterways
+      tag: waterways-latest
+      title: "Global cropped waterways layer"
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+
+  publish-b2-waterways:
+    needs: build
+    uses: ./.github/workflows/_publish-b2.yml
+    secrets: inherit
+    with:
+      pmtiles_artifact: waterways-pmtiles
+      output_basename: waterways

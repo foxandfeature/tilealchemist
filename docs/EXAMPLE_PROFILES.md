@@ -29,14 +29,18 @@ they're actually on land. See it combined with `land` in
 
 ## `land`
 
-For every tile in the z0..`max_zoom` pyramid, `LandProfile.transform_tile_bytes()`
-(`tilealchemist/profiles/land.py`):
+For every tile in the z0..`max_zoom` pyramid, `LandProfile.transform_layer()`
+(`tilealchemist/profiles/land.py`), called by the inherited
+`Profile.transform_tile_bytes()`:
 
 1. Asks the schema for this tile's real surface water
    (`schema.surface_water(decoded)`, see `TileSchema` in
    [`docs/PROFILES.md`](PROFILES.md)). For `OPENMAPTILES` this reads the
    `water` layer and drops tunnel water (`brunnel == "tunnel"`: a water
-   polygon running through a tunnel isn't open water at the surface).
+   polygon running through a tunnel isn't open water at the surface), and
+   hands back each remaining polygon as a raw MVT-decoded geometry dict;
+   `LandProfile` itself parses those into shapely (`shapely.geometry.shape`)
+   right before unioning them.
 2. Unions those polygons via `tilealchemist/water.py:union_polygons()`.
 3. Inverts the tile: `land = tile_square - union(remaining water polygons)`,
    entirely in that tile's own local coordinates. `tile_square` is buffered
@@ -57,12 +61,14 @@ buffered square: full land is the well-defined "nothing to subtract" case.
 
 ## `cropped-waterways`
 
-`CroppedWaterwaysProfile.transform_tile_bytes()`
-(`tilealchemist/profiles/cropped_waterways.py`) reads this tile's waterway
-line features via `schema.waterway_lines(decoded)`, and the *same*
-`schema.surface_water(decoded)` + `union_polygons()` result the land
-profile would compute for that tile, then keeps only the portion of each
-waterway line that doesn't overlap it (`geometry.difference(union)`).
+`CroppedWaterwaysProfile.transform_layer()`
+(`tilealchemist/profiles/cropped_waterways.py`), called by the inherited
+`Profile.transform_tile_bytes()`, reads this tile's waterway line features
+via `schema.waterway_lines(decoded)` (each feature's raw MVT-decoded
+geometry dict is parsed into shapely by the profile itself, same as `land`),
+and the *same* `schema.surface_water(decoded)` + `union_polygons()` result
+the land profile would compute for that tile, then keeps only the portion of
+each waterway line that doesn't overlap it (`geometry.difference(union)`).
 Reusing the exact same union (not recomputing it independently) matters: if
 the two profiles' water polygons disagreed even by a sub-pixel amount, a
 cropped waterway line and the land polygon it's meant to hug could show a

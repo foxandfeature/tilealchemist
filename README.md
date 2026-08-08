@@ -66,12 +66,17 @@ one-line `gh release download` command that reassembles them.
 
 ## Running it
 
-Each profile has its own `.github/workflows/build-<profile>.yml`
-(`build-land.yml`, `build-cropped-waterways.yml`), triggered manually
-(`workflow_dispatch`, input `max_zoom`) or on its own monthly schedule;
-they run fully independently of each other. The finished `.pmtiles` is
-uploaded both as a workflow artifact and as a GitHub Release, replaced on
-every run rather than kept alongside older ones.
+Both profiles are built together by
+`.github/workflows/build-land-and-waterways.yml`, triggered manually
+(`workflow_dispatch`, input `max_zoom`) or on a monthly schedule. It calls
+`_pipeline.yml` once with both profiles (`profile`/`output_basename` accept
+a comma-separated list), sharing one `prepare-shards` walk and one fetch
+per worker, so OpenFreeMap only sees each tile's bytes fetched once per
+run regardless of how many profiles are built from it; each profile's
+transform then runs against those same fetched bytes. The finished
+`.pmtiles` files are uploaded both as workflow artifacts and as
+GitHub Releases, replaced on every run rather than kept alongside older
+ones.
 
 There's nothing to install or configure to trigger a run; it's all driven
 from GitHub Actions. `pyproject.toml` and the `tilealchemist/` package
@@ -101,13 +106,13 @@ are actually called.
 | `docs/EXAMPLE_PROFILES.md` | What the shipped `land`/`cropped-waterways` profiles compute. |
 | `docs/ARCHITECTURE.md` | Pipeline mechanics: `Source` resolution, fetching, sharding, publishing. |
 | `examples/` | One example MapLibre style per profile. |
-| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel, merges into a `.pmtiles` artifact. Never publishes. Safe to call cross-repo. |
-| `.github/workflows/_publish-release.yml` | Reusable: publishes a `_pipeline.yml` artifact as a GitHub Release. Safe to call cross-repo. |
-| `.github/workflows/_publish-b2.yml` | Reusable: mirrors a `_pipeline.yml` artifact to Backblaze B2. Repo-internal only, see `docs/ARCHITECTURE.md` "Publishing". |
-| `.github/workflows/build-<profile>.yml` | Calls `_pipeline.yml` with one profile, then publishes. One per shipped profile, each independent. |
+| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel, merges into one `.pmtiles` artifact per profile. `profile`/`output_basename` take one value or a comma-separated list, sharing one `prepare-shards` walk and one fetch per worker across however many profiles are given. Never publishes. Safe to call cross-repo. |
+| `.github/workflows/_publish-release.yml` | Reusable: publishes a merged `.pmtiles` artifact as a GitHub Release. Safe to call cross-repo. |
+| `.github/workflows/_publish-b2.yml` | Reusable: mirrors a merged `.pmtiles` artifact to Backblaze B2. Repo-internal only, see `docs/ARCHITECTURE.md` "Publishing". |
+| `.github/workflows/build-land-and-waterways.yml` | Calls `_pipeline.yml` with both shipped profiles at once, sharing one fetch, then publishes each separately. |
 | `pyproject.toml` | Packaging: dependencies, console scripts, this repo's own `tilealchemist.profiles` entry points. |
 | `tilealchemist/prepare_shards.py` | Walks the source PMTiles directory once, partitions tiles into per-worker manifests. Needs a `Source`, not a `Profile`. |
-| `tilealchemist/build_shard.py` | One worker: fetches its manifest's tiles, runs the selected `Profile`'s transform, writes an mbtiles shard. |
+| `tilealchemist/build_shard.py` | One worker: fetches its manifest's tiles once, runs one or more selected `Profile`s' transforms against those same fetched bytes, writes one mbtiles shard per profile. |
 | `tilealchemist/profiles/` | The `Profile` ABC, plus the built-in `land`/`cropped-waterways` implementations. |
 | `tilealchemist/sources/` | The `Source` ABC, plus `OpenFreeMapSource` and `StaticUrlSource`. |
 | `tilealchemist/schemas.py` | The `TileSchema` ABC, `OpenMapTilesSchema`, and the `SCHEMAS` registry. |

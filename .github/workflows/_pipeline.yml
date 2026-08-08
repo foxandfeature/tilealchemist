@@ -1,20 +1,32 @@
 name: TileAlchemist pipeline (reusable)
 
-# Builds one profile's world-covering PMTiles layer: prepare-shards walks
-# the source archive once, build-shards runs the profile's per-tile
-# transform across WORKER_COUNT parallel workers, merge joins the shards
-# into one .pmtiles file. Deliberately does NOT publish anywhere (no
-# GitHub Release, no B2 upload): that's the calling workflow's job, so its
+# Builds one or more profiles' world-covering PMTiles layers: prepare-shards
+# walks the source archive once, build-shards runs every profile's per-tile
+# transform against the SAME fetched bytes across WORKER_COUNT parallel
+# workers (one HTTP range GET per worker regardless of how many profiles
+# are being built), merge joins each profile's own shards into its own
+# .pmtiles file. Deliberately does NOT publish anywhere (no GitHub Release,
+# no B2 upload): that's the calling workflow's job, so its
 # `environment:`/secrets resolve against the caller's own repository, not
-# this one (see docs/ARCHITECTURE.md "Publishing"). Callers: build-land.yml,
-# build-cropped-waterways.yml, or a third-party repo's own workflow via
+# this one (see docs/ARCHITECTURE.md "Publishing"). Callers:
+# build-land-and-waterways.yml, or a third-party repo's own workflow via
 # `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
+#
+# `profile`/`output_basename` accept either one value (e.g. "land") or a
+# comma-separated list matched 1:1 (e.g. "land,cropped-waterways" /
+# "land,waterways") - a single value behaves identically to before this
+# supported multiple profiles. The `pmtiles_artifact` output is only
+# reliable when `profile` has exactly one entry (GitHub Actions doesn't
+# guarantee consistent job outputs across multiple matrix cells - see the
+# `merge` job below); a multi-profile caller should reference each
+# `<output_basename>-pmtiles` artifact directly instead, since that name is
+# fully deterministic.
 
 on:
   workflow_call:
     inputs:
       profile:
-        description: 'tilealchemist.profiles entry point name to apply, e.g. "land" or "cropped-waterways".'
+        description: 'tilealchemist.profiles entry point name(s) to apply - one value (e.g. "land") or a comma-separated list matched 1:1 with output_basename (e.g. "land,cropped-waterways").'
         required: true
         type: string
       profile_package:
@@ -37,16 +49,16 @@ on:
         type: string
         default: "14"
       output_basename:
-        description: 'Base name for the output .pmtiles file and its artifact, e.g. "land" or "waterways".'
+        description: "Base name for each profile's output .pmtiles file and artifact - one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,waterways\"."
         required: true
         type: string
       attribution:
-        description: "HTML attribution string embedded in the merged PMTiles metadata via tile-join --attribution."
+        description: "HTML attribution string embedded in every profile's merged PMTiles metadata via tile-join --attribution."
         required: true
         type: string
     outputs:
       pmtiles_artifact:
-        description: "Name of the workflow artifact holding the merged .pmtiles file."
+        description: "Name of the workflow artifact holding the merged .pmtiles file. Only reliable when profile has exactly one entry; for multiple profiles, reference <output_basename>-pmtiles directly instead."
         value: ${{ jobs.merge.outputs.pmtiles_artifact }}
 
 env:
@@ -56,8 +68,21 @@ jobs:
   prepare-shards:
     runs-on: ubuntu-latest
     outputs:
-      workers: ${{ steps.gen.outputs.workers }}
+      workers: ${{ steps.gen-workers.outputs.workers }}
+      profile_pairs: ${{ steps.gen-pairs.outputs.profile_pairs }}
     steps:
+      - name: Validate profile/output_basename line up 1:1
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          IFS=',' read -ra P <<< "$PROFILE"
+          IFS=',' read -ra B <<< "$OUTPUT_BASENAME"
+          if [ "${#P[@]}" -ne "${#B[@]}" ]; then
+            echo "::error::profile has ${#P[@]} entries but output_basename has ${#B[@]}; must match 1:1"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -81,11 +106,23 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.output_basename }}-shard-manifests
+          name: shard-manifests
           path: manifests
 
-      - id: gen
+      - id: gen-workers
         run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+      - id: gen-pairs
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          echo "profile_pairs=$(python3 -c '
+          import json, os
+          profiles = os.environ["PROFILE"].split(",")
+          basenames = os.environ["OUTPUT_BASENAME"].split(",")
+          print(json.dumps([{"profile": p, "output_basename": b} for p, b in zip(profiles, basenames)]))
+          ')" >> "$GITHUB_OUTPUT"
 
   build-shards:
     needs: prepare-shards
@@ -112,45 +149,63 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.output_basename }}-shard-manifests
+          name: shard-manifests
           path: manifests
 
-      - name: Build this worker's tile shard
+      - name: Build this worker's tile shard(s) - one fetch, every profile
         env:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
         run: |
           WORKER_ID=$(printf '%03d' ${{ matrix.worker }})
+          IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
+          OUT_PATHS=()
+          for BASENAME in "${BASENAMES[@]}"; do
+            OUT_PATHS+=("${BASENAME}-shard-${{ matrix.worker }}.mbtiles")
+          done
+          OUT_JOINED=$(IFS=,; echo "${OUT_PATHS[*]}")
           tilealchemist-build-shard \
             --worker-index ${{ matrix.worker }} \
             --profile "$PROFILE" \
             --manifest "manifests/worker-${WORKER_ID}.bin" \
             --source manifests/source.json \
-            --out "${OUTPUT_BASENAME}-shard-${{ matrix.worker }}.mbtiles"
+            --out "$OUT_JOINED"
 
-      # A worker's whole slice can legitimately produce nothing (e.g. an
-      # all-ocean slice for the land profile, or a slice with no waterway
-      # features at all), so an empty output here is expected, not a
-      # failure.
+      # A worker's slice can legitimately produce nothing for some or all
+      # profiles (e.g. an all-ocean slice has no waterway to crop), so a
+      # missing file here is expected, not a failure. Bundling every
+      # profile's file for one worker under a single artifact is safe
+      # because the glob's fixed "-shard-N.mbtiles" suffix means two
+      # different basenames can never spuriously match each other's
+      # later per-profile glob in the merge job below.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ inputs.output_basename }}-shard-${{ matrix.worker }}
-          path: ${{ inputs.output_basename }}-shard-${{ matrix.worker }}.mbtiles
+          name: shards-${{ matrix.worker }}
+          path: "*-shard-${{ matrix.worker }}.mbtiles"
           if-no-files-found: ignore
 
   merge:
-    needs: build-shards
+    needs: [prepare-shards, build-shards]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ${{ fromJson(needs.prepare-shards.outputs.profile_pairs) }}
     outputs:
       pmtiles_artifact: ${{ steps.artifact-name.outputs.name }}
     steps:
       - uses: actions/checkout@v4
 
+      # Downloads every profile's worker shards, even when this run only
+      # has one profile (harmless: there's only ever one to download then).
+      # With multiple profiles, each matrix cell downloads every profile's
+      # shards and uses only its own via the filename-prefix glob below -
+      # CI-internal bandwidth/time only, not an extra OpenFreeMap hit.
       - name: Download all shard artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.output_basename }}-shard-*
+          pattern: shards-*
           path: shards
           merge-multiple: true
 
@@ -170,26 +225,26 @@ jobs:
       # because tr otherwise fully buffers its output once it's writing to
       # a pipe instead of a terminal, which would defeat the throttling by
       # delivering every line in one burst at the end instead of live.
-      - name: Merge shards into the final layer
+      - name: Merge this profile's shards into its final layer
         env:
           ATTRIBUTION: ${{ inputs.attribution }}
-          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
         run: |
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
-            -o "${OUTPUT_BASENAME}.pmtiles" shards/*.mbtiles 2>&1 \
+            -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \
             | stdbuf -oL tr '\r' '\n' \
             | tilealchemist/throttle_progress.sh 60 '^[0-9]+/[0-9]+/[0-9]+[[:space:]]*$'
 
       - name: Summarize
         env:
-          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
         run: |
-          SHARD_COUNT=$(find shards -name '*.mbtiles' | wc -l | tr -d ' ')
+          SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
           SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
           {
             echo "### ${OUTPUT_BASENAME} layer"
-            echo "- profile: ${{ inputs.profile }}"
+            echo "- profile: ${{ matrix.pair.profile }}"
             echo "- max_zoom: ${{ inputs.max_zoom }}"
             echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
             echo "- output size: $SIZE"
@@ -197,10 +252,10 @@ jobs:
 
       - id: artifact-name
         env:
-          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
         run: echo "name=${OUTPUT_BASENAME}-pmtiles" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.output_basename }}-pmtiles
-          path: ${{ inputs.output_basename }}.pmtiles
+          name: ${{ matrix.pair.output_basename }}-pmtiles
+          path: ${{ matrix.pair.output_basename }}.pmtiles

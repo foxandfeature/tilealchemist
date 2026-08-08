@@ -18,19 +18,21 @@ directly.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from shapely.geometry import shape
-
 
 @dataclass(frozen=True)
 class SurfaceWater:
     extent: int
-    polygons: list  # shapely geometries; tunnel/bridge water already excluded, per this schema's own rules
+    polygons: list  # raw MVT-decoded geometry dicts (e.g. {"type": "Polygon", "coordinates": [...]},
+                     # exactly what mapbox_vector_tile.decode() produces per-feature); tunnel/bridge
+                     # water already excluded, per this schema's own rules. Geometry-library-agnostic
+                     # by design: parsing into shapely or anything else is up to the consuming profile.
 
 
 @dataclass(frozen=True)
 class WaterwayFeatures:
     extent: int
-    features: list  # [{"geometry": <shapely geometry>, "properties": dict}, ...], properties preserved as-is
+    features: list  # [{"geometry": <raw MVT-decoded geometry dict>, "properties": dict}, ...],
+                     # properties preserved as-is; geometry left unparsed, same as SurfaceWater.polygons
 
 
 class TileSchema(ABC):
@@ -45,10 +47,10 @@ class TileSchema(ABC):
 
     @abstractmethod
     def waterway_lines(self, decoded_tile):
-        """This tile's waterway line features, geometry parsed to a shapely
-        object and properties preserved as-is, as a
-        WaterwayFeatures(extent, features), or None if there's no waterway
-        data at all for this schema."""
+        """This tile's waterway line features, geometry left as the raw
+        MVT-decoded dict (not parsed into any geometry library) and
+        properties preserved as-is, as a WaterwayFeatures(extent, features),
+        or None if there's no waterway data at all for this schema."""
 
     @abstractmethod
     def waterway_fields(self):
@@ -76,7 +78,7 @@ class OpenMapTilesSchema(TileSchema):
         if not water:
             return None
         polygons = [
-            shape(feature["geometry"])
+            feature["geometry"]
             for feature in water["features"]
             if feature["properties"].get("brunnel") != "tunnel"
         ]
@@ -87,7 +89,7 @@ class OpenMapTilesSchema(TileSchema):
         if not waterway:
             return None
         features = [
-            {"geometry": shape(feature["geometry"]), "properties": feature["properties"]}
+            {"geometry": feature["geometry"], "properties": feature["properties"]}
             for feature in waterway["features"]
         ]
         return WaterwayFeatures(extent=waterway["extent"], features=features)

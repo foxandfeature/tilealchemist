@@ -43,7 +43,11 @@ community-run server. Instead:
 3. Each `tilealchemist/build_shard.py` worker reads only its own manifest
    and fetches it with a single range GET spanning its first entry's
    offset to its last entry's end, reliable since the manifest is already
-   a contiguous slice of offset order.
+   a contiguous slice of offset order. When a worker is building multiple
+   profiles in one invocation (`--profile land,cropped-waterways`, see
+   "Publishing" below), it still does exactly one range GET for the batch
+   and reuses those same fetched bytes for every profile's transform,
+   instead of fetching once per profile.
 4. Reuses PMTiles' own deduplication: byte-identical tiles (e.g. a long run
    of open-ocean tiles) share one directory entry with a `run_length`,
    decoded and transformed once. Non-adjacent duplicates (step 2) show up
@@ -72,21 +76,47 @@ a higher `WORKER_COUNT` doesn't add parallelism at any one moment, just
 keeps each job smaller. Each worker writes its own small mbtiles shard; a
 final job merges all shards with `tile-join` into one `.pmtiles` file.
 
+A worker building multiple profiles in one run (`_pipeline.yml` called with
+a comma-separated `profile`) still does exactly one fetch, so per-worker
+*network* time is unchanged;
+per-worker *CPU* time (decode, transform, encode, sqlite insert) scales
+with the number of profiles built together, since that work genuinely
+repeats once per profile against the same fetched bytes. Worth revisiting
+`WORKER_COUNT` only if a much heavier profile is ever added to a
+multi-profile run, not for today's two lightweight profiles.
+
 ## Publishing
 
 `.github/workflows/_pipeline.yml` is a **reusable** workflow
 (`on: workflow_call`) containing only `prepare-shards` → `build-shards` →
 `merge`, parameterized by `profile`, `source`, `output_basename`, and
-`attribution`. Its `merge` job produces `<output_basename>.pmtiles`,
-uploads it as a workflow artifact, and stops there: it deliberately does
-**not** publish anywhere, so a third-party caller (see
+`attribution`. `profile`/`output_basename` each take one value (e.g.
+`profile: land`) or a comma-separated list matched 1:1 (e.g.
+`profile: land,cropped-waterways` / `output_basename: land,waterways`), so
+`prepare-shards` and each worker's fetch happen once per run regardless of
+how many profiles are built (see "Fetching"/"Parallelism" above): its
+`build-shards` step passes the full profile list to one
+`tilealchemist-build-shard` invocation per worker (comma-separated
+`--profile`/`--out`, matched 1:1), bundles every profile's shard file for
+that worker under one artifact, and its `merge` job matrixes over
+`{profile, output_basename}` pairs, each producing its own
+`<output_basename>.pmtiles`, uploaded as its own workflow artifact. It
+deliberately does **not** publish anywhere, so a third-party caller (see
 [`docs/PROFILES.md`](PROFILES.md)) is never forced through this repo's own
-credentials.
+credentials. This is a documented, cross-repo, public contract; a
+single-value `profile`/`output_basename` call (the only form third parties
+are documented to use) behaves identically to before this workflow
+supported multiple profiles - the `pmtiles_artifact` output is only
+reliable in that single-profile case (GitHub Actions doesn't guarantee
+consistent job outputs across multiple matrix cells), so a multi-profile
+caller should reference each `<output_basename>-pmtiles` artifact directly
+instead, which is fully deterministic.
 
-Publishing is two more reusable workflows, both called by every
-`build-<profile>.yml` caller (today: `build-land.yml`,
-`build-cropped-waterways.yml`), but not equally safe to call from *outside*
-this repo:
+Publishing is two more reusable workflows, called once per profile by
+`build-land-and-waterways.yml` (four jobs total: two profiles x two publish
+targets) - both only ever consume one named `<output_basename>-pmtiles`
+artifact, regardless of how many profiles `_pipeline.yml` built it
+alongside. Not equally safe to call from *outside* this repo:
 
 - **`_publish-release.yml`** (`pmtiles_artifact`, `output_basename`, `tag`,
   `title`, `max_zoom` inputs) downloads the artifact, splits it into
@@ -110,7 +140,8 @@ this repo:
 
 Every `publish-*` job `needs:` the job that calls `_pipeline.yml`, the one
 real cross-job dependency; everything else flows through `inputs.*` or
-named artifacts. A third-party repo calls `_pipeline.yml` via
+named artifacts. A third-party repo calls
+`_pipeline.yml` via
 `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`,
 a native cross-repo capability of reusable workflows, no GitHub Marketplace
 listing required.

@@ -17,6 +17,10 @@ Logging to stderr is split into two kinds:
     tilealchemist-build-shard --worker-index 0 --profile land \
         --manifest manifests/worker-000.bin --source manifests/source.json \
         --out land-shard-0.mbtiles
+
+    tilealchemist-build-shard --worker-index 0 --profile land,cropped-waterways \
+        --manifest manifests/worker-000.bin --source manifests/source.json \
+        --out land-shard-0.mbtiles,waterways-shard-0.mbtiles
 """
 import argparse
 import bisect
@@ -195,15 +199,13 @@ def transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, prof
     return results
 
 
-def fetch_and_transform_batch(session, url, tile_data_offset, batch, max_zoom, download_progress, transform_progress,
-                               worker_index, retry_log, profile):
-    batch_offset, batch_length, batch_entries = batch
-    print(f"worker {worker_index}: starting download "
-          f"({batch_length} bytes, {len(batch_entries)} entries)", file=sys.stderr)
-    blob = fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, download_progress, worker_index,
-                                               retry_log)
-    print(f"worker {worker_index}: starting transform ({len(batch_entries)} entries)", file=sys.stderr)
-    return transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, profile)
+def transform_and_write(blob, batch, max_zoom, profile, profile_name, connection, worker_index, report_interval):
+    _, _, batch_entries = batch
+    transform_progress = TransformProgress(worker_index, len(batch_entries), report_interval)
+    print(f"worker {worker_index}: starting transform for profile {profile_name!r} ({len(batch_entries)} entries)",
+          file=sys.stderr)
+    results = transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, profile)
+    return write_output_tiles(results, connection)
 
 
 def init_mbtiles(path, max_zoom, profile):
@@ -232,14 +234,37 @@ def parse_args():
     parser.add_argument("--worker-index", type=int, required=True)
     parser.add_argument("--manifest", required=True, help="this worker's manifest file from prepare_shards.py")
     parser.add_argument("--source", required=True, help="source.json written by prepare_shards.py")
-    parser.add_argument("--out", required=True, help="output mbtiles path")
-    parser.add_argument("--profile", choices=sorted(PROFILES), required=True,
-                         help="which per-tile transform to apply")
+    parser.add_argument("--out", required=True,
+                         help="comma-separated output mbtiles path(s), one per --profile, matched by position")
+    parser.add_argument("--profile", required=True,
+                         help="comma-separated tilealchemist.profiles entry point name(s) to apply, e.g. "
+                              "\"land\" or \"land,cropped-waterways\" "
+                              f"(available: {', '.join(sorted(PROFILES))})")
     parser.add_argument("--schema", choices=sorted(SCHEMAS), default="openmaptiles",
                          help="which source tile schema to read (default openmaptiles)")
     parser.add_argument("--report-interval", type=float, default=DEFAULT_REPORT_INTERVAL,
                          help="seconds between throttled progress updates (default 60)")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    profile_names = args.profile.split(",")
+    out_paths = args.out.split(",")
+    if len(profile_names) != len(out_paths):
+        parser.error(f"--profile has {len(profile_names)} entries but --out has {len(out_paths)}; "
+                      f"they must match 1:1")
+    unknown = [name for name in profile_names if name not in PROFILES]
+    if unknown:
+        parser.error(f"unknown profile(s): {', '.join(unknown)} (available: {', '.join(sorted(PROFILES))})")
+    for name in profile_names:
+        compatible = PROFILES[name].compatible_schemas
+        if compatible is not None and args.schema not in compatible:
+            parser.error(
+                f"profile {name!r} is not compatible with schema {args.schema!r} "
+                f"(compatible schemas: {', '.join(sorted(compatible))})"
+            )
+    args.profile = profile_names
+    args.out = out_paths
+
+    return args
 
 
 def load_source(path):
@@ -257,7 +282,10 @@ def split_manifest_entries(entries):
     return real_entries, gap_entries
 
 
-def fetch_and_transform_real_entries(real_entries, args, source, retry_log, profile):
+def fetch_real_entries_blob(real_entries, args, source, retry_log):
+    """Single shared network fetch for this worker's real entries, reused by
+    every profile in args.profile - the raw bytes don't depend on which
+    profile(s) transform them afterward."""
     session = make_session()
     batch_offset = real_entries[0].offset
     batch_length = max(entry.offset + entry.length for entry in real_entries) - batch_offset
@@ -266,9 +294,11 @@ def fetch_and_transform_real_entries(real_entries, args, source, retry_log, prof
           f"({batch_length} bytes)", file=sys.stderr)
 
     download_progress = DownloadProgress(args.worker_index, batch_length, args.report_interval)
-    transform_progress = TransformProgress(args.worker_index, len(real_entries), args.report_interval)
-    return fetch_and_transform_batch(session, source["url"], source["tile_data_offset"], batch, source["max_zoom"],
-                                      download_progress, transform_progress, args.worker_index, retry_log, profile)
+    print(f"worker {args.worker_index}: starting download ({batch_length} bytes, {len(real_entries)} entries)",
+          file=sys.stderr)
+    blob = fetch_batch_streaming_with_retries(session, source["url"], source["tile_data_offset"], batch,
+                                               download_progress, args.worker_index, retry_log)
+    return blob, batch
 
 
 def write_output_tiles(results, connection):
@@ -335,44 +365,53 @@ def main():
     # Setup: CLI args, source archive info, this worker's assigned entries.
     args = parse_args()
     source = load_source(args.source)
-    profile = PROFILES[args.profile](SCHEMAS[args.schema])
+    profiles = [PROFILES[name](SCHEMAS[args.schema]) for name in args.profile]
     print(f"worker {args.worker_index}: source={source['url']} (build {source['build']}), "
-          f"profile={profile.name}", file=sys.stderr)
+          f"profiles={', '.join(p.name for p in profiles)}", file=sys.stderr)
 
     entries = read_manifest(args.manifest)
     real_entries, gap_entries = split_manifest_entries(entries)
     print(f"worker {args.worker_index}: {len(real_entries)} real entries + {len(gap_entries)} gap ranges assigned",
           file=sys.stderr)
 
-    connection = init_mbtiles(args.out, source["max_zoom"], profile)
+    connections = [init_mbtiles(out, source["max_zoom"], profile) for out, profile in zip(args.out, profiles)]
 
     # Empty shard: nothing assigned to this worker at all.
     if not real_entries and not gap_entries:
-        connection.commit()
-        connection.close()
-        print(f"worker {args.worker_index} done: written=0 skipped=0 (empty shard) -> {args.out}", file=sys.stderr)
+        for connection in connections:
+            connection.commit()
+            connection.close()
+        print(f"worker {args.worker_index} done: (empty shard) -> {', '.join(args.out)}", file=sys.stderr)
         return
 
-    written = skipped = 0
+    written = [0] * len(profiles)
+    skipped = [0] * len(profiles)
     retry_log = []
 
-    # Real entries: fetch + transform + write.
+    # Real entries: fetch once, then transform + write once per profile
+    # against the same fetched bytes.
     if real_entries:
-        results = fetch_and_transform_real_entries(real_entries, args, source, retry_log, profile)
-        batch_written, batch_skipped = write_output_tiles(results, connection)
-        written += batch_written
-        skipped += batch_skipped
+        blob, batch = fetch_real_entries_blob(real_entries, args, source, retry_log)
+        for i, (name, profile, connection) in enumerate(zip(args.profile, profiles, connections)):
+            w, s = transform_and_write(blob, batch, source["max_zoom"], profile, name, connection,
+                                        args.worker_index, args.report_interval)
+            written[i] += w
+            skipped[i] += s
 
-    # Gap entries: no fetch needed, just write whatever the profile fills gaps with.
+    # Gap entries: no fetch needed, just write whatever each profile fills gaps with.
     if gap_entries:
-        batch_written, batch_skipped = write_gap_tiles(gap_entries, connection, args.worker_index, profile)
-        written += batch_written
-        skipped += batch_skipped
+        for i, (profile, connection) in enumerate(zip(profiles, connections)):
+            w, s = write_gap_tiles(gap_entries, connection, args.worker_index, profile)
+            written[i] += w
+            skipped[i] += s
 
-    # Finalize: persist the shard and report results.
-    connection.commit()
-    connection.close()
-    print(f"worker {args.worker_index} done: written={written} skipped={skipped} -> {args.out}", file=sys.stderr)
+    # Finalize: persist every shard and report results, one line per profile.
+    for connection in connections:
+        connection.commit()
+        connection.close()
+
+    for name, out, w, s in zip(args.profile, args.out, written, skipped):
+        print(f"worker {args.worker_index} done: profile={name} written={w} skipped={s} -> {out}", file=sys.stderr)
 
     write_retry_summary(args.worker_index, retry_log)
 
