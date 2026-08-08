@@ -5,17 +5,20 @@ name: Publish to Backblaze B2 (reusable, repo-internal)
 #
 # Unlike _pipeline.yml and _publish-release.yml, this workflow is NOT meant
 # to be called cross-repo, and must not be advertised as such (see README's
-# "Adding a profile"). A job's `environment:` (and that environment's
-# secrets) inside a reusable workflow resolves against the repository that
-# owns the *workflow file*, not the caller's. That's harmless here only
-# because both callers (build-land.yml, build-cropped-waterways.yml) live
-# in this same repository: "the workflow file's own repo" and "the
-# caller's repo" are the same repo either way, so this is a plain
-# same-repo DRY refactor, not a cross-repo capability. If a third-party
-# repo ever called this file directly, its job would resolve against
-# *this* repo's own `b2-publish` environment and B2 credentials instead of
-# its own, exactly the credential-leak shape _pipeline.yml avoids by
-# staying publish-free.
+# "Adding a profile"). A job's `environment:` inside a reusable workflow
+# gates approval against the repository that owns the *workflow file*, not
+# the caller's — but the environment's *secrets* still don't reach this
+# workflow's `secrets.*` context unless the caller job passes them (see
+# `secrets: inherit` on both callers). That's harmless here only because
+# both callers (build-land.yml, build-cropped-waterways.yml) live in this
+# same repository: "the workflow file's own repo" and "the caller's repo"
+# are the same repo either way, so this is a plain same-repo DRY refactor,
+# not a cross-repo capability. If a third-party repo ever called this file
+# directly (which would additionally require it to pass `secrets: inherit`
+# or explicit secrets itself), its job would resolve against *this* repo's
+# own `b2-publish` environment and B2 credentials instead of its own,
+# exactly the credential-leak shape _pipeline.yml avoids by staying
+# publish-free.
 
 on:
   workflow_call:

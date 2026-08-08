@@ -49,6 +49,7 @@ jobs:
   publish-b2:
     needs: build
     uses: ./.github/workflows/_publish-b2.yml
+    secrets: inherit
     with:
       pmtiles_artifact: ${{ needs.build.outputs.pmtiles_artifact }}
       output_basename: waterways
