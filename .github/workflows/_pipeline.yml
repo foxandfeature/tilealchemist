@@ -1,0 +1,263 @@
+name: TileAlchemist pipeline (reusable)
+
+# Builds one or more profiles' world-covering PMTiles layers: prepare-shards
+# walks the source archive once, build-shards runs every profile's per-tile
+# transform against the SAME fetched bytes across `worker_count` parallel
+# workers (one HTTP range GET per worker regardless of how many profiles
+# are being built), merge joins each profile's own shards into its own
+# .pmtiles file. Deliberately does NOT publish anywhere (no GitHub Release,
+# no B2 upload): that's the calling workflow's job, so its
+# `environment:`/secrets resolve against the caller's own repository, not
+# this one (see docs/ARCHITECTURE.md "Publishing"). Callers:
+# build-land-and-waterways.yml, or a third-party repo's own workflow via
+# `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
+#
+# `profile`/`output_basename` each take one value (e.g.
+# "tilealchemist/profiles/land.py") or a comma-separated list matched 1:1
+# (e.g. "tilealchemist/profiles/land.py,tilealchemist/profiles/cropped_waterways.py"
+# / "land,cropped-waterways"); a single value is simply a list of one,
+# handled the same way. Each profile's merged .pmtiles is uploaded as a
+# `<output_basename>-pmtiles` artifact (see the `merge` job below); callers
+# reference that name directly rather than through a job output, since
+# GitHub Actions doesn't guarantee consistent job outputs across multiple
+# matrix cells.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: 'Path(s) to a profile''s .py file to apply (its own requirements.txt, if any, lives right next to it and is installed automatically): one value, or a comma-separated list matched 1:1 with output_basename, e.g. "tilealchemist/profiles/land.py" or "tilealchemist/profiles/land.py,./my_profile.py".'
+        required: true
+        type: string
+      source:
+        description: 'tilealchemist.sources entry to resolve the PMTiles archive from.'
+        required: false
+        type: string
+        default: "openfreemap"
+      source_url:
+        description: 'PMTiles URL to use; required when source is "static-url".'
+        required: false
+        type: string
+        default: ""
+      max_zoom:
+        required: false
+        type: string
+        default: "14"
+      worker_count:
+        description: "How many parallel shard-building jobs to fan out into. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\")."
+        required: false
+        type: string
+        default: "64"
+      output_basename:
+        description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
+        required: true
+        type: string
+      attribution:
+        description: "HTML attribution string embedded in every profile's merged PMTiles metadata via tile-join --attribution."
+        required: true
+        type: string
+
+jobs:
+  prepare-shards:
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.gen-workers.outputs.workers }}
+      profile_pairs: ${{ steps.gen-pairs.outputs.profile_pairs }}
+    steps:
+      - name: Validate profile/output_basename line up 1:1
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          IFS=',' read -ra P <<< "$PROFILE"
+          IFS=',' read -ra B <<< "$OUTPUT_BASENAME"
+          if [ "${#P[@]}" -ne "${#B[@]}" ]; then
+            echo "::error::profile has ${#P[@]} entries but output_basename has ${#B[@]}; must match 1:1"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tilealchemist
+        run: pip install .
+
+      - name: Walk archive directory and partition into per-worker manifests
+        env:
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+          SOURCE: ${{ inputs.source }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: |
+          ARGS=(--worker-count "$WORKER_COUNT" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
+          if [ -n "$SOURCE_URL" ]; then
+            ARGS+=(--source-url "$SOURCE_URL")
+          fi
+          tilealchemist-prepare-shards "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-manifests
+          path: manifests
+
+      - id: gen-workers
+        env:
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+      - id: gen-pairs
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          echo "profile_pairs=$(python3 -c '
+          import json, os
+          profiles = os.environ["PROFILE"].split(",")
+          basenames = os.environ["OUTPUT_BASENAME"].split(",")
+          print(json.dumps([{"profile": p, "output_basename": b} for p, b in zip(profiles, basenames)]))
+          ')" >> "$GITHUB_OUTPUT"
+
+  build-shards:
+    needs: prepare-shards
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare-shards.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Every profile's own deps come from a requirements.txt living right
+      # next to its .py file (the built-in land.py/cropped_waterways.py
+      # both point at tilealchemist/profiles/requirements.txt this way,
+      # same as any custom profile's own path); see
+      # tilealchemist/profiles/__init__.py's `load_profile()`. This needs
+      # no lookup into pyproject.toml, so a profile that needs nothing
+      # beyond the base package never pulls anything extra in.
+      - name: Install tilealchemist
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          pip install .
+
+          IFS=',' read -ra PROFILES <<< "$PROFILE"
+          for P in "${PROFILES[@]}"; do
+            REQUIREMENTS="$(dirname "$P")/requirements.txt"
+            if [ -f "$REQUIREMENTS" ]; then
+              pip install -r "$REQUIREMENTS"
+            fi
+          done
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shard-manifests
+          path: manifests
+
+      - name: "Build this worker's tile shard(s): one fetch, every profile"
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          WORKER_ID=$(printf '%03d' ${{ matrix.worker }})
+          IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
+          OUT_PATHS=()
+          for BASENAME in "${BASENAMES[@]}"; do
+            OUT_PATHS+=("${BASENAME}-shard-${{ matrix.worker }}.mbtiles")
+          done
+          OUT_JOINED=$(IFS=,; echo "${OUT_PATHS[*]}")
+          tilealchemist-build-shard \
+            --worker-index ${{ matrix.worker }} \
+            --profile "$PROFILE" \
+            --manifest "manifests/worker-${WORKER_ID}.bin" \
+            --source manifests/source.json \
+            --out "$OUT_JOINED"
+
+      # A worker's slice can legitimately produce nothing for some or all
+      # profiles (e.g. an all-ocean slice has no waterway to crop), so a
+      # missing file here is expected, not a failure. Bundling every
+      # profile's file for one worker under a single artifact is safe
+      # because the glob's fixed "-shard-N.mbtiles" suffix means two
+      # different basenames can never spuriously match each other's
+      # later per-profile glob in the merge job below.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shards-${{ matrix.worker }}
+          path: "*-shard-${{ matrix.worker }}.mbtiles"
+          if-no-files-found: ignore
+
+  merge:
+    needs: [prepare-shards, build-shards]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ${{ fromJson(needs.prepare-shards.outputs.profile_pairs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Downloads every profile's worker shards, even when this run only
+      # has one profile (harmless: there's only ever one to download then).
+      # With multiple profiles, each matrix cell downloads every profile's
+      # shards and uses only its own via the filename-prefix glob below:
+      # CI-internal bandwidth/time only, not an extra OpenFreeMap hit.
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shards-*
+          path: shards
+          merge-multiple: true
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tippecanoe || {
+            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+            make -C /tmp/tippecanoe -j"$(nproc)"
+            sudo make -C /tmp/tippecanoe install
+          }
+
+      # tile-join reports progress as a `z/x/y` line rewritten in place with
+      # \r; throttled through tilealchemist/throttle_progress.sh for the same
+      # reason as the worker progress logs (see README); everything else
+      # (warnings, errors) passes through immediately. stdbuf -oL is needed
+      # because tr otherwise fully buffers its output once it's writing to
+      # a pipe instead of a terminal, which would defeat the throttling by
+      # delivering every line in one burst at the end instead of live.
+      - name: Merge this profile's shards into its final layer
+        env:
+          ATTRIBUTION: ${{ inputs.attribution }}
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
+        run: |
+          tile-join --no-tile-size-limit \
+            --attribution="$ATTRIBUTION" \
+            -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \
+            | stdbuf -oL tr '\r' '\n' \
+            | tilealchemist/throttle_progress.sh 60 '^[0-9]+/[0-9]+/[0-9]+[[:space:]]*$'
+
+      - name: Summarize
+        env:
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: |
+          SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
+          SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
+          {
+            echo "### ${OUTPUT_BASENAME} layer"
+            echo "- profile: ${{ matrix.pair.profile }}"
+            echo "- max_zoom: ${{ inputs.max_zoom }}"
+            echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
+            echo "- output size: $SIZE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pair.output_basename }}-pmtiles
+          path: ${{ matrix.pair.output_basename }}.pmtiles

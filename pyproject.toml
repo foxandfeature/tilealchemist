@@ -1,0 +1,26 @@
+[project]
+name = "tilealchemist"
+version = "0.1.0"
+description = "Generate global PMTiles layers from OpenStreetMap-derived PMTiles sources via pluggable per-tile processing profiles."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "pmtiles",
+    "requests",
+    "mapbox-vector-tile",
+]
+
+[project.urls]
+Repository = "https://github.com/foxandfeature/tilealchemist"
+
+[project.scripts]
+tilealchemist-prepare-shards = "tilealchemist.prepare_shards:main"
+tilealchemist-build-shard = "tilealchemist.build_shard:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tilealchemist*"]
