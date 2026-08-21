@@ -219,23 +219,31 @@ def partition_by_index(entries, worker_count):
 
 def partition_contiguous(entries, worker_count):
     """Splits `entries` (sorted by offset) into `worker_count` contiguous
-    blocks of about n/W each. It's only "about" because a whole run of
-    same-offset entries always goes to one worker, even past the target
-    size (see README.md "Fetching")."""
+    blocks of about total_length/W *bytes* each, not entry_count/W
+    *entries* each: entries vary a lot in size (e.g. a dense city tile vs.
+    a small rural one), and both fetch time (one Range GET spanning a
+    worker's whole block) and transform time correlate far more closely
+    with bytes than with entry count. It's only "about" because a whole
+    run of same-offset entries always goes to one worker, even past the
+    target size (see README.md "Fetching")."""
     entry_count = len(entries)
+    total_length = sum(entry.length for entry in entries)
     blocks = [[] for _ in range(worker_count)]
     if entry_count == 0:
         return blocks
     worker = 0
     index = 0
+    cumulative_length = 0
     while index < entry_count:
         run_end = index + 1
         while run_end < entry_count and entries[run_end].offset == entries[index].offset:
             run_end += 1
-        blocks[worker].extend(entries[index:run_end])
+        run = entries[index:run_end]
+        blocks[worker].extend(run)
+        cumulative_length += sum(entry.length for entry in run)
         index = run_end
-        target = entry_count * (worker + 1) // worker_count
-        if index >= target and worker < worker_count - 1:
+        target_bytes = total_length * (worker + 1) // worker_count
+        if cumulative_length >= target_bytes and worker < worker_count - 1:
             worker += 1
     return blocks
 
