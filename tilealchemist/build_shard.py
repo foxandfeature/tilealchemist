@@ -173,7 +173,7 @@ def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, do
             return result
 
 
-def transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, profile):
+def transform_batch_blob_deduped(blob, batch, min_zoom, max_zoom, transform_progress, profile):
     """Offset-based partitioning (see README.md "Fetching") can group two
     separate entries that dedupe to the same non-adjacent bytes into one
     worker, on top of PMTiles' own per-entry run_length dedup. Entries are
@@ -196,21 +196,21 @@ def transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, prof
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
         for run_offset in range(entry.run_length):
             zoom, tile_column, tile_row = tileid_to_zxy(entry.tile_id + run_offset)
-            if zoom <= max_zoom:
+            if min_zoom <= zoom <= max_zoom:
                 results.append((zoom, tile_column, tile_row, output_data))
     return results
 
 
-def transform_and_write(blob, batch, max_zoom, profile, connection, report_interval):
+def transform_and_write(blob, batch, min_zoom, max_zoom, profile, connection, report_interval):
     _, _, batch_entries = batch
     transform_progress = TransformProgress(len(batch_entries), report_interval)
     print(f"starting transform for profile {profile.name!r} ({len(batch_entries)} entries)",
           file=sys.stderr)
-    results = transform_batch_blob_deduped(blob, batch, max_zoom, transform_progress, profile)
+    results = transform_batch_blob_deduped(blob, batch, min_zoom, max_zoom, transform_progress, profile)
     return write_output_tiles(results, connection)
 
 
-def init_mbtiles(path, max_zoom, profile):
+def init_mbtiles(path, min_zoom, max_zoom, profile):
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
     connection.execute(
@@ -225,7 +225,7 @@ def init_mbtiles(path, max_zoom, profile):
         [
             ("name", profile.mbtiles_name),
             ("format", "pbf"),
-            ("minzoom", "0"),
+            ("minzoom", str(min_zoom)),
             ("maxzoom", str(max_zoom)),
             ("bounds", WORLD_BOUNDS),
             ("json", vector_layers_json),
@@ -387,7 +387,7 @@ def main():
     print(f"{len(real_entries)} real entries + {len(gap_entries)} gap ranges assigned",
           file=sys.stderr)
 
-    connections = [init_mbtiles(out, source["max_zoom"], profile)
+    connections = [init_mbtiles(out, source["min_zoom"], source["max_zoom"], profile)
                     for out, profile in zip(args.out, profiles)]
 
     # Empty shard: nothing assigned to this worker at all.
@@ -408,7 +408,8 @@ def main():
         blob, batch = fetch_real_entries_blob(real_entries, args, source, retry_log)
         for i, (profile, connection) in enumerate(zip(profiles, connections)):
             written_count, skipped_count = transform_and_write(
-                blob, batch, source["max_zoom"], profile, connection, args.report_interval)
+                blob, batch, source["min_zoom"], source["max_zoom"], profile, connection,
+                args.report_interval)
             written[i] += written_count
             skipped[i] += skipped_count
 

@@ -5,7 +5,7 @@ see `compute_gaps()`) into `--worker-count` contiguous manifests, one per
 worker. See README.md ("Fetching") for why it's structured this way, and
 tilealchemist/sources/ for how the archive URL itself gets resolved.
 
-    tilealchemist-prepare-shards --worker-count 64 --max-zoom 14 \
+    tilealchemist-prepare-shards --worker-count 64 --min-zoom 0 --max-zoom 14 \
         --out-dir manifests/
 """
 import argparse
@@ -98,22 +98,34 @@ def fetch_range(session, url, offset, length, retry_log):
             return result
 
 
-def fetch_directory_node(session, url, header, node_offset, node_length, tile_id_limit, retry_log):
+def fetch_directory_node(session, url, header, node_offset, node_length,
+                          tile_id_start, tile_id_limit, retry_log):
+    """Prunes at both ends of tile-ID space, symmetric to how the upper
+    (max_zoom) bound already worked before min_zoom existed: sibling entries
+    in a directory are sorted and non-overlapping, so an entry's own tile_id
+    is the minimum tile_id anywhere in its subtree, and the next sibling's
+    tile_id (or tile_id_limit, past the last sibling) is an upper bound on
+    it. That's enough to decide "entirely below tile_id_start" or "entirely
+    at/above tile_id_limit" without ever fetching the subtree, so min_zoom
+    shrinks the walk itself instead of just filtering its result."""
     data = fetch_range(session, url, node_offset, node_length, retry_log)
     directory = deserialize_directory(data)
     terminal_entries = []
     child_pointers = []
-    for entry in directory:
+    for index, entry in enumerate(directory):
         if entry.tile_id >= tile_id_limit:
             break
         if entry.run_length == 0:
-            child_pointers.append((header["leaf_directory_offset"] + entry.offset, entry.length))
-        else:
+            next_tile_id = (directory[index + 1].tile_id if index + 1 < len(directory)
+                             else tile_id_limit)
+            if next_tile_id > tile_id_start:
+                child_pointers.append((header["leaf_directory_offset"] + entry.offset, entry.length))
+        elif entry.tile_id + entry.run_length > tile_id_start:
             terminal_entries.append(entry)
     return terminal_entries, child_pointers
 
 
-def walk_directory_tree(session, url, header, tile_id_limit, retry_log):
+def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retry_log):
     """Workers return their results instead of submitting new work
     themselves, to avoid deadlocking this bounded pool via recursive
     submission."""
@@ -129,7 +141,7 @@ def walk_directory_tree(session, url, header, tile_id_limit, retry_log):
                 node_offset, node_length = frontier.pop()
                 pending.add(executor.submit(
                     fetch_directory_node, session, url, header,
-                    node_offset, node_length, tile_id_limit, retry_log))
+                    node_offset, node_length, tile_id_start, tile_id_limit, retry_log))
 
             done, pending = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -146,12 +158,13 @@ def walk_directory_tree(session, url, header, tile_id_limit, retry_log):
     return entries
 
 
-def collect_entries(session, url, max_zoom, retry_log):
-    """All directory entries covering z=0..max_zoom, in ascending *offset*
-    order (see README.md "Fetching" for why offset order)."""
+def collect_entries(session, url, min_zoom, max_zoom, retry_log):
+    """All directory entries covering min_zoom..max_zoom, in ascending
+    *offset* order (see README.md "Fetching" for why offset order)."""
     header = deserialize_header(fetch_range(session, url, 0, 127, retry_log))
+    tile_id_start = zxy_to_tileid(min_zoom, 0, 0) if min_zoom > 0 else 0
     tile_id_limit = zxy_to_tileid(max_zoom + 1, 0, 0)
-    entries = walk_directory_tree(session, url, header, tile_id_limit, retry_log)
+    entries = walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retry_log)
     entries.sort(key=lambda entry: entry.offset)
     return header, entries
 
@@ -162,15 +175,15 @@ def collect_entries(session, url, max_zoom, retry_log):
 GAP_CHUNK_SIZE = 200_000
 
 
-def compute_gaps(entries, tile_id_limit):
-    """Gaps in [0, tile_id_limit) not covered by any entry (see README.md
-    "Fetching"). Directory entries never overlap in tile_id space, so once
-    sorted by tile_id, each entry's end is always >= the previous one's,
-    so `expected` can just be overwritten every iteration below instead of
-    tracked as a running max."""
+def compute_gaps(entries, tile_id_start, tile_id_limit):
+    """Gaps in [tile_id_start, tile_id_limit) not covered by any entry (see
+    README.md "Fetching"). Directory entries never overlap in tile_id space,
+    so once sorted by tile_id, each entry's end is always >= the previous
+    one's, so `expected` can just be overwritten every iteration below
+    instead of tracked as a running max."""
     by_tileid = sorted(entries, key=lambda e: e.tile_id)
     gaps = []
-    expected = 0
+    expected = tile_id_start
     for entry in by_tileid:
         if entry.tile_id > expected:
             gaps.extend(_chunk_gap(expected, entry.tile_id))
@@ -234,6 +247,13 @@ def max_zoom_type(value):
     return zoom
 
 
+def min_zoom_type(value):
+    zoom = int(value)
+    if not (0 <= zoom <= MAX_SUPPORTED_ZOOM):
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_SUPPORTED_ZOOM}")
+    return zoom
+
+
 def write_retry_summary(retry_log):
     """Mirrors build_shard.py's write_retry_summary(): appended to
     GITHUB_STEP_SUMMARY (a no-op outside GitHub Actions) so a run that hit
@@ -255,6 +275,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--worker-count", type=int, default=64)
+    parser.add_argument("--min-zoom", type=min_zoom_type, default=0)
     parser.add_argument("--max-zoom", type=max_zoom_type, default=14)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--source", choices=sorted(SOURCES), default="openfreemap",
@@ -262,6 +283,9 @@ def main():
     parser.add_argument("--source-url", default=None,
                          help="the PMTiles URL to use, required when --source static-url")
     args = parser.parse_args()
+
+    if args.min_zoom > args.max_zoom:
+        parser.error(f"--min-zoom ({args.min_zoom}) must not exceed --max-zoom ({args.max_zoom})")
 
     os.makedirs(args.out_dir, exist_ok=True)
     retry_log = []
@@ -273,13 +297,14 @@ def main():
 
     # one-time directory walk
     session = make_session(WALK_WORKER_COUNT)
-    header, entries = collect_entries(session, url, args.max_zoom, retry_log)
+    header, entries = collect_entries(session, url, args.min_zoom, args.max_zoom, retry_log)
     print(f"directory walk found {len(entries)} distinct tile entries "
-          f"(max_zoom={args.max_zoom})", file=sys.stderr)
+          f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})", file=sys.stderr)
 
     # find genuinely-absent tiles (gaps)
+    tile_id_start = zxy_to_tileid(args.min_zoom, 0, 0) if args.min_zoom > 0 else 0
     tile_id_limit = zxy_to_tileid(args.max_zoom + 1, 0, 0)
-    gaps = compute_gaps(entries, tile_id_limit)
+    gaps = compute_gaps(entries, tile_id_start, tile_id_limit)
     gap_tile_count = sum(gap.run_length for gap in gaps)
     print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "
           f"entry at all", file=sys.stderr)
@@ -297,6 +322,7 @@ def main():
         json.dump({
             "url": url,
             "build": timestamp,
+            "min_zoom": args.min_zoom,
             "max_zoom": args.max_zoom,
             "tile_data_offset": header["tile_data_offset"],
         }, file)

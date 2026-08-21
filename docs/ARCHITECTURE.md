@@ -25,11 +25,16 @@ z0..z14 that's ~358M individual requests, too much load for a single free
 community-run server. Instead:
 
 1. `tilealchemist/prepare_shards.py` walks the PMTiles directory tree
-   (root + leaf directories) up to `max_zoom` **once, for the whole run**,
-   not once per worker, yielding every tile's
+   (root + leaf directories) between `min_zoom` (default 0) and `max_zoom`
+   **once, for the whole run**, not once per worker, yielding every tile's
    `(tile_id, offset, length, run_length)`. Depends only on the resolved
    `Source`, never touches tile content, so it's identical regardless of
-   which `Profile` runs later.
+   which `Profile` runs later. Both bounds prune the walk itself, not just
+   its result: sibling entries in a directory are sorted and non-overlapping
+   tile-ID ranges, so a child pointer whose whole range falls outside
+   `[min_zoom, max_zoom]` is never even fetched, the same way `max_zoom`
+   already skipped fetching subtrees entirely past it before `min_zoom`
+   existed (see `fetch_directory_node()`).
 2. It sorts entries by *offset* (not tile-ID) and splits them into
    `--worker-count` (the reusable pipeline's `worker_count` input, default
    64) **contiguous** chunks, one per worker (`tilealchemist/manifest.py`).
@@ -118,8 +123,9 @@ targets); both only ever consume one named `<output_basename>-pmtiles`
 artifact, regardless of how many profiles `_pipeline.yml` built it
 alongside. Not equally safe to call from *outside* this repo:
 
-- **`_publish-release.yml`** (`output_basename`, `tag`, `title`, `max_zoom`
-  inputs) downloads the `<output_basename>-pmtiles` artifact, splits it
+- **`_publish-release.yml`** (`output_basename`, `tag`, `title`,
+  `min_zoom`, `max_zoom` inputs) downloads the `<output_basename>-pmtiles`
+  artifact, splits it
   into numbered parts if needed, and publishes/replaces a fixed-tag
   GitHub Release. Safe to call cross-repo: it only uses the automatic
   `secrets.GITHUB_TOKEN` and `github.repository`/`github.run_number`,

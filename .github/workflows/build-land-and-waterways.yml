@@ -10,6 +10,10 @@ name: Build Global Land + Cropped Waterways Layers
 on:
   workflow_dispatch:
     inputs:
+      min_zoom:
+        description: "Min zoom for both layers (default: 0)."
+        required: false
+        default: "0"
       max_zoom:
         description: "Max zoom for both layers (default: 14)."
         required: false
@@ -23,6 +27,7 @@ jobs:
     with:
       profile: tilealchemist/profiles/land.py,tilealchemist/profiles/cropped_waterways.py
       output_basename: land,cropped-waterways
+      min_zoom: ${{ inputs.min_zoom || '0' }}
       max_zoom: ${{ inputs.max_zoom || '14' }}
       attribution: '<a href="https://github.com/foxandfeature/tilealchemist">TileAlchemist</a> &middot; <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
 
@@ -35,6 +40,7 @@ jobs:
       output_basename: land
       tag: land-latest
       title: "Global land layer"
+      min_zoom: ${{ inputs.min_zoom || '0' }}
       max_zoom: ${{ inputs.max_zoom || '14' }}
 
   # Gated by the `b2-publish` GitHub Environment (see _publish-b2.yml for
@@ -55,6 +61,7 @@ jobs:
       output_basename: cropped-waterways
       tag: cropped-waterways-latest
       title: "Global cropped waterways layer"
+      min_zoom: ${{ inputs.min_zoom || '0' }}
       max_zoom: ${{ inputs.max_zoom || '14' }}
 
   publish-b2-cropped-waterways:

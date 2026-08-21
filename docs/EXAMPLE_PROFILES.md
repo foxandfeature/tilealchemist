@@ -29,7 +29,7 @@ they're actually on land. See it combined with `land` in
 
 ## `land`
 
-For every tile in the z0..`max_zoom` pyramid, `LandProfile.transform_layer()`
+For every tile in the `min_zoom`..`max_zoom` pyramid, `LandProfile.transform_layer()`
 (`tilealchemist/profiles/land.py`), called by the inherited
 `Profile.transform_tile_bytes()`:
 

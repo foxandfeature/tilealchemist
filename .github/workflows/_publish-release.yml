@@ -30,6 +30,11 @@ on:
         description: 'Release title, e.g. "Global land layer".'
         required: true
         type: string
+      min_zoom:
+        description: "Included in the release notes text."
+        required: false
+        type: string
+        default: "0"
       max_zoom:
         description: "Included in the release notes text."
         required: true
@@ -69,6 +74,7 @@ jobs:
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
           TAG: ${{ inputs.tag }}
           TITLE: ${{ inputs.title }}
+          MIN_ZOOM: ${{ inputs.min_zoom }}
           MAX_ZOOM: ${{ inputs.max_zoom }}
         run: |
           FILE="${OUTPUT_BASENAME}.pmtiles"
@@ -90,7 +96,7 @@ jobs:
             WIN_CMD="$DL_CMD"
           fi
           printf '%s\n' \
-            "${TITLE}, max_zoom=${MAX_ZOOM}." \
+            "${TITLE}, min_zoom=${MIN_ZOOM}, max_zoom=${MAX_ZOOM}." \
             "Built $(date -u +%Y-%m-%d) (run #${{ github.run_number }})." \
             "" \
             "Download (requires the [GitHub CLI](https://cli.github.com/), \`gh\`):" \

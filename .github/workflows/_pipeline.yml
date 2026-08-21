@@ -39,6 +39,10 @@ on:
         required: false
         type: string
         default: ""
+      min_zoom:
+        required: false
+        type: string
+        default: "0"
       max_zoom:
         required: false
         type: string
@@ -87,12 +91,13 @@ jobs:
 
       - name: Walk archive directory and partition into per-worker manifests
         env:
+          MIN_ZOOM: ${{ inputs.min_zoom }}
           MAX_ZOOM: ${{ inputs.max_zoom }}
           SOURCE: ${{ inputs.source }}
           SOURCE_URL: ${{ inputs.source_url }}
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: |
-          ARGS=(--worker-count "$WORKER_COUNT" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
+          ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi
@@ -252,6 +257,7 @@ jobs:
           {
             echo "### ${OUTPUT_BASENAME} layer"
             echo "- profile: ${{ matrix.pair.profile }}"
+            echo "- min_zoom: ${{ inputs.min_zoom }}"
             echo "- max_zoom: ${{ inputs.max_zoom }}"
             echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
             echo "- output size: $SIZE"

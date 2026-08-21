@@ -69,7 +69,8 @@ one-line `gh release download` command that reassembles them.
 
 Both profiles are built together by
 `.github/workflows/build-land-and-waterways.yml`, triggered manually
-(`workflow_dispatch`, input `max_zoom`) or on a monthly schedule. It calls
+(`workflow_dispatch`, inputs `min_zoom`/`max_zoom`) or on a monthly
+schedule. It calls
 `_pipeline.yml` once with both profiles (`profile`/`output_basename` accept
 a comma-separated list), sharing one `prepare-shards` walk and one fetch
 per worker, so OpenFreeMap only sees each tile's bytes fetched once per
