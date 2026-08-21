@@ -232,10 +232,7 @@ jobs:
       # tile-join reports progress as a `z/x/y` line rewritten in place with
       # \r; throttled through tilealchemist/throttle_progress.sh for the same
       # reason as the worker progress logs (see README); everything else
-      # (warnings, errors) passes through immediately. stdbuf -oL is needed
-      # because tr otherwise fully buffers its output once it's writing to
-      # a pipe instead of a terminal, which would defeat the throttling by
-      # delivering every line in one burst at the end instead of live.
+      # (warnings, errors) passes through immediately.
       - name: Merge this profile's shards into its final layer
         env:
           ATTRIBUTION: ${{ inputs.attribution }}
@@ -244,8 +241,7 @@ jobs:
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
             -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \
-            | stdbuf -oL tr '\r' '\n' \
-            | tilealchemist/throttle_progress.sh 60 '^[0-9]+/[0-9]+/[0-9]+[[:space:]]*$'
+            | tilealchemist/throttle_progress.sh 60
 
       - name: Summarize
         env:
