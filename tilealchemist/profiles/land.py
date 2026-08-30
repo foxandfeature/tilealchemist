@@ -4,7 +4,6 @@ a buffered tile square after subtracting them. See docs/EXAMPLE_PROFILES.md
 past the tile edge and why the water union gets a snap-rounding difference.
 """
 import shapely
-from shapely.geometry import box, shape
 
 from tilealchemist import water
 from tilealchemist.profiles.base import Profile
@@ -29,10 +28,6 @@ class LandProfile(Profile):
     def vector_layers_json(self):
         return [{"id": self.output_layer_name, "fields": {}}]
 
-    def _buffered_square(self, extent):
-        buffer = extent * self.schema.default_buffer_pixels / self.schema.tile_size_pixels
-        return box(-buffer, -buffer, extent + buffer, extent + buffer)
-
     def _land_features(self, land):
         # mapbox_vector_tile rounds coordinates to water.OUTPUT_GRID_SIZE per
         # polygon piece, with no awareness of how pieces relate to each
@@ -55,25 +50,7 @@ class LandProfile(Profile):
         (skipped, same as a missing tile in any vector tileset)."""
         surface = self.schema.surface_water(decoded_tile)
         extent = surface.extent if surface is not None else GAP_TILE_EXTENT
-        square = self._buffered_square(extent)
-
-        polygons = [shape(geometry) for geometry in surface.polygons] if surface is not None else []
-        union = water.union_polygons(polygons)
-        if union is not None:
-            # Forces GEOS's fixed-precision (snap-rounding) overlay instead
-            # of the default floating-point one. The float overlay computes
-            # edge intersections with ordinary float arithmetic; on geometry
-            # with near-coincident or near-collinear points (buffer(0)
-            # leftovers, water nearly touching the tile square) two edges
-            # that should meet at one point can resolve to two float-apart
-            # points instead, so the polygonizer can't match a hole ring to
-            # its shell and throws (seen live on real OpenFreeMap water
-            # geometry). Snap-rounding pre-snaps coordinates to a fixed
-            # grid before computing intersections, so that inconsistency
-            # can't arise.
-            land = square.difference(union, grid_size=water.OUTPUT_GRID_SIZE)
-        else:
-            land = square
+        land = water.land_polygon(decoded_tile, self.schema, extent)
 
         features = self._land_features(land)
         return (features, extent) if features is not None else None
@@ -84,7 +61,7 @@ class LandProfile(Profile):
         square regardless of location: (zoom, tile_column, tile_row) go
         unused here, this profile has no location-dependent gap policy."""
         if self._gap_tile_cache is None:
-            square = self._buffered_square(GAP_TILE_EXTENT)
+            square = water.buffered_square(GAP_TILE_EXTENT, self.schema)
             features = self._land_features(square)
             self._gap_tile_cache = (
                 self._encode_tile(features, GAP_TILE_EXTENT) if features is not None else None)

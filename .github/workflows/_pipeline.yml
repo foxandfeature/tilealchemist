@@ -109,11 +109,13 @@ jobs:
           path: manifests
 
       - id: gen-workers
+        name: Generate worker index matrix
         env:
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
 
       - id: gen-pairs
+        name: Generate profile/output-basename pairs
         env:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}

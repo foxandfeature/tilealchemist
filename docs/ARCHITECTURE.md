@@ -85,12 +85,32 @@ with `tile-join` into one `.pmtiles` file.
 
 A worker building multiple profiles in one run (`_pipeline.yml` called with
 a comma-separated `profile`) still does exactly one fetch, so per-worker
-*network* time is unchanged;
-per-worker *CPU* time (decode, transform, encode, sqlite insert) scales
-with the number of profiles built together, since that work genuinely
-repeats once per profile against the same fetched bytes. Worth revisiting
-`worker_count` only if a much heavier profile is ever added to a
-multi-profile run, not for today's two lightweight profiles.
+*network* time is unchanged. Per-worker *CPU* time no longer simply scales
+with the number of profiles built together the way it used to: `build_shard.py`
+now decodes each unique tile once and hands the same decoded tile to every
+profile back-to-back (entries outer, profiles inner in
+`transform_batch_blob_multi()`), and `mvt.decode_tile()`/`water.py`'s
+`surface_water_union()` each memoize their own last call by object identity,
+so a second profile reading the same tile right after the first is a cache
+hit rather than repeated gunzip+protobuf decode or polygon-union work. Two
+profiles that don't share any of that underlying work (a hypothetical
+buildings profile alongside `land`, say) still each pay their own cost in
+full - only genuinely-shared steps (decode, and `land`/`cropped-waterways`'s
+own shared water union) got cheaper.
+
+Independently of that, the transform phase itself (decode, transform,
+encode, sqlite insert - all CPU-bound, not network) can now fan out across a
+worker's own CPU cores via `--transform-workers` (default: all available
+cores; `1` disables pooling and matches the old single-process behavior
+exactly). `real_entries` is split into contiguous chunks, one process pool
+task per chunk; each task reloads its profiles from their own `--profile`
+paths rather than receiving live instances (profiles loaded via
+`load_profile()`'s `importlib.util.spec_from_file_location()` aren't
+registered in `sys.modules`, so the default pickler used to hand work to a
+pool worker can't reconstruct them there). See
+`tests/test_low_zoom_regression.py` for a real-data (low zoom, so it stays
+fast) regression check that both of these changes produce identical output
+to the old per-profile, single-process behavior.
 
 ## Publishing
 

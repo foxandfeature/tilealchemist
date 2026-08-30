@@ -263,20 +263,13 @@ def min_zoom_type(value):
 
 
 def write_retry_summary(retry_log):
-    """Mirrors build_shard.py's write_retry_summary(): appended to
-    GITHUB_STEP_SUMMARY (a no-op outside GitHub Actions) so a run that hit
-    the OpenFreeMap CDN's cold-cache stampede is visible without having to
-    dig through this job's raw logs."""
-    if not retry_log:
-        return
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_path:
-        return
-    with open(summary_path, "a") as file:
-        file.write(f"### prepare-shards: {len(retry_log)} retry(ies) needed\n")
-        for status_code, attempt, delay, reason in retry_log:
-            file.write(f"- got HTTP {status_code}{reason} on attempt "
-                       f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s\n")
+    """Mirrors build_shard.py's write_retry_summary(): emitted as
+    ::warning:: workflow commands so a run that hit the OpenFreeMap CDN's
+    cold-cache stampede shows up as an actual warning status in the Actions
+    UI, not just buried in the job summary."""
+    for status_code, attempt, delay, reason in retry_log:
+        print(f"::warning title=prepare-shards retry::got HTTP {status_code}{reason} on attempt "
+              f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s")
 
 
 def main():

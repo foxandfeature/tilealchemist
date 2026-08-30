@@ -17,9 +17,22 @@ import mapbox_vector_tile
 from mapbox_vector_tile.encoder import on_invalid_geometry_make_valid
 
 
+_cached_data = None
+_cached_tile = None
+
+
 def decode_tile(data):
-    """One gzipped source MVT tile's bytes -> decoded {layer_name: {...}} dict."""
-    return mapbox_vector_tile.decode(gzip.decompress(data))
+    """One gzipped source MVT tile's bytes -> decoded {layer_name: {...}} dict.
+    Single-slot memoized by `data`'s object identity: when build_shard.py hands
+    the same bytes object to two profiles back-to-back for the same tile (e.g.
+    land + cropped-waterways), the second call is a cache hit instead of a
+    second gunzip + protobuf decode. A cache miss costs nothing extra over
+    decoding directly."""
+    global _cached_data, _cached_tile
+    if data is not _cached_data:
+        _cached_tile = mapbox_vector_tile.decode(gzip.decompress(data))
+        _cached_data = data
+    return _cached_tile
 
 
 def encode_tile(layer_name, features, extent):

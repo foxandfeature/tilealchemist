@@ -54,9 +54,7 @@ class CroppedWaterwaysProfile(Profile):
         if waterway is None:
             return None
         extent = waterway.extent
-        surface = self.schema.surface_water(decoded_tile)
-        polygons = [shape(geometry) for geometry in surface.polygons] if surface is not None else []
-        union = water.union_polygons(polygons)
+        union = water.surface_water_union(decoded_tile, self.schema)
         if union is not None:
             # grid_size= on difference() alone isn't enough here: unlike
             # land's polygon-polygon case, GEOS's precision-reducing overlay

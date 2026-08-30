@@ -25,6 +25,7 @@ Logging to stderr is split into two kinds:
 """
 import argparse
 import bisect
+import concurrent.futures
 import json
 import os
 import sqlite3
@@ -196,41 +197,130 @@ def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, do
             return result
 
 
-def transform_batch_blob_deduped(blob, batch, min_zoom, max_zoom, transform_progress, profile):
-    """Offset-based partitioning (see README.md "Fetching") can group two
-    separate entries that dedupe to the same non-adjacent bytes into one
+def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles):
+    """Same dedup rationale as before this was generalized to multiple
+    profiles: offset-based partitioning (see README.md "Fetching") can group
+    two separate entries that dedupe to the same non-adjacent bytes into one
     worker, on top of PMTiles' own per-entry run_length dedup. Entries are
     sorted by offset, so such a pair is always adjacent here too, meaning
     comparing against the previous entry's (offset, length) is enough to
-    catch it."""
+    catch it - now for every profile's output at once, computed once per
+    entry instead of once per profile per entry.
+
+    Entries outer, profiles inner: each entry's `tile_data` slice is sliced
+    from `blob` once and handed to every profile's own, unchanged
+    `transform_tile_bytes()` on that same object, back-to-back. This is what
+    lets `mvt.decode_tile()`'s and `water.py`'s single-slot caches (both
+    keyed by object identity) actually hit when two profiles read the same
+    tile - if profiles were the outer loop instead, by the time a second
+    profile reached this entry, unrelated entries processed in between would
+    already have evicted the cached slot."""
     batch_offset, _batch_length, batch_entries = batch
-    results = []
+    results = [[] for _ in profiles]
     previous_key = None
-    previous_output_data = None
+    previous_outputs = None
     for entry in batch_entries:
         key = (entry.offset, entry.length)
         if key == previous_key:
-            output_data = previous_output_data
+            outputs = previous_outputs
         else:
             tile_data = blob[entry.offset - batch_offset:
                               entry.offset - batch_offset + entry.length]
-            output_data = profile.transform_tile_bytes(tile_data)
-            previous_key, previous_output_data = key, output_data
+            outputs = [profile.transform_tile_bytes(tile_data) for profile in profiles]
+            previous_key, previous_outputs = key, outputs
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
         for run_offset in range(entry.run_length):
             zoom, tile_column, tile_row = tileid_to_zxy(entry.tile_id + run_offset)
             if min_zoom <= zoom <= max_zoom:
-                results.append((zoom, tile_column, tile_row, output_data))
+                for profile_results, output_data in zip(results, outputs):
+                    profile_results.append((zoom, tile_column, tile_row, output_data))
     return results
 
 
-def transform_and_write(blob, batch, min_zoom, max_zoom, profile, connection, report_interval):
-    _, _, batch_entries = batch
-    transform_progress = TransformProgress(len(batch_entries), report_interval)
-    print(f"starting transform for profile {profile.name!r} ({len(batch_entries)} entries)",
-          file=sys.stderr)
-    results = transform_batch_blob_deduped(blob, batch, min_zoom, max_zoom, transform_progress, profile)
-    return write_output_tiles(results, connection)
+class _NullProgress:
+    """Stand-in for TransformProgress in a pool worker process: per-chunk
+    completion is reported by the parent process instead (see run_transform()),
+    since TransformProgress's throttle uses a threading.Lock, which can't be
+    pickled across a process boundary at all."""
+
+    def tick(self, tile):
+        pass
+
+
+def _chunk_entries(real_entries, transform_workers):
+    """Split real_entries into up to `transform_workers` contiguous, ordered
+    chunks (order matters for the consecutive-entry dedup in
+    transform_batch_blob_multi(); a dedup pair split across a chunk boundary
+    just misses that one dedup, which is harmless). Always at least 1 chunk,
+    never more chunks than entries."""
+    chunk_count = max(1, min(transform_workers, len(real_entries)))
+    chunk_size = -(-len(real_entries) // chunk_count)  # ceil division
+    return [real_entries[i:i + chunk_size] for i in range(0, len(real_entries), chunk_size)]
+
+
+def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
+    """This chunk's own slice of `blob`, plus the absolute offset it starts
+    at - so a pool worker can index into just its slice with the same
+    `entry.offset - chunk's own batch_offset` arithmetic
+    transform_batch_blob_multi() already does, without needing the full blob
+    (keeps the amount of data pickled to each worker process proportional to
+    that worker's own chunk, not the whole batch)."""
+    chunk_offset = chunk_entries[0].offset
+    end = max(entry.offset + entry.length for entry in chunk_entries)
+    return blob[chunk_offset - batch_offset:end - batch_offset], chunk_offset
+
+
+def _transform_chunk(profile_paths, schema_name, min_zoom, max_zoom, blob_slice, blob_slice_offset,
+                      chunk_entries):
+    """Runs in a pool worker process (see run_transform()). Profiles can't be
+    passed in as live instances or classes: load_profile() imports each
+    profile's .py file via importlib.util.spec_from_file_location() without
+    registering it in sys.modules (profiles/__init__.py), so the default
+    pickler used to send this call's arguments to the worker process has no
+    way to reconstruct them there. Reloading from `profile_paths` here costs
+    one cheap reimport per chunk, not per tile. mvt.py's/water.py's
+    module-level caches need no extra setup: this is a separate process, so
+    they start out fresh automatically."""
+    profiles = [profile_class(SCHEMAS[schema_name])
+                for profile_class in (load_profile(path) for path in profile_paths)]
+    batch = (blob_slice_offset, len(blob_slice), chunk_entries)
+    return transform_batch_blob_multi(blob_slice, batch, min_zoom, max_zoom, _NullProgress(), profiles)
+
+
+def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
+    """Runs the transform phase either inline (today's behavior, and always
+    used for a single chunk) or fanned out across a process pool, one chunk
+    of real_entries per process. The CPU-bound part (decode, transform,
+    encode) is what benefits from more cores; the network fetch that produced
+    `blob` already happened once, sequentially, before this is called."""
+    batch_offset, _batch_length, real_entries = batch
+    chunks = _chunk_entries(real_entries, args.transform_workers)
+    profile_names = ", ".join(repr(profile.name) for profile in profiles)
+
+    if len(chunks) <= 1:
+        print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries)",
+              file=sys.stderr)
+        transform_progress = TransformProgress(len(real_entries), args.report_interval)
+        return transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles)
+
+    print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries, "
+          f"{len(chunks)} chunks across up to {args.transform_workers} processes)", file=sys.stderr)
+    results_per_profile = [[] for _ in profiles]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = {}
+        for index, chunk in enumerate(chunks):
+            blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
+            future = executor.submit(
+                _transform_chunk, args.profile, args.schema, min_zoom, max_zoom,
+                blob_slice, blob_slice_offset, chunk)
+            futures[future] = (index, len(chunk))
+        for future in concurrent.futures.as_completed(futures):
+            index, entry_count = futures[future]
+            chunk_results = future.result()
+            for profile_results, chunk_profile_results in zip(results_per_profile, chunk_results):
+                profile_results.extend(chunk_profile_results)
+            print(f"chunk {index + 1}/{len(chunks)} done ({entry_count} entries)", file=sys.stderr)
+    return results_per_profile
 
 
 def init_mbtiles(path, min_zoom, max_zoom, profile):
@@ -276,6 +366,10 @@ def parse_args():
                          help="which source tile schema to read (default openmaptiles)")
     parser.add_argument("--report-interval", type=float, default=DEFAULT_REPORT_INTERVAL,
                          help="seconds between throttled progress updates (default 60)")
+    parser.add_argument("--transform-workers", type=int, default=os.cpu_count() or 1,
+                         help="parallel processes for the CPU-bound transform phase "
+                              "(default: all available cores; 1 disables pooling and runs "
+                              "inline, same as before this flag existed)")
     args = parser.parse_args()
 
     profile_paths = args.profile.split(",")
@@ -385,16 +479,12 @@ def write_gap_tiles(gap_entries, connection, profile):
 
 
 def write_retry_summary(worker_index, retry_log):
-    if not retry_log:
-        return
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_path:
-        return
-    with open(summary_path, "a") as file:
-        file.write(f"### worker {worker_index}: {len(retry_log)} retry(ies) needed\n")
-        for label, attempt, delay in retry_log:
-            file.write(f"- got {label} on attempt "
-                       f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s\n")
+    """Emitted as ::warning:: workflow commands so a run that hit the
+    OpenFreeMap CDN's cold-cache stampede shows up as an actual warning
+    status in the Actions UI, not just buried in the job summary."""
+    for label, attempt, delay in retry_log:
+        print(f"::warning title=worker {worker_index} retry::got {label} on attempt "
+              f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s")
 
 
 def main():
@@ -425,14 +515,14 @@ def main():
     skipped = [0] * len(profiles)
     retry_log = []
 
-    # Real entries: fetch once, then transform + write once per profile
-    # against the same fetched bytes.
+    # Real entries: fetch once, then transform every profile together
+    # against the same fetched bytes (see run_transform()/transform_batch_blob_multi()).
     if real_entries:
         blob, batch = fetch_real_entries_blob(real_entries, args, source, retry_log)
-        for i, (profile, connection) in enumerate(zip(profiles, connections)):
-            written_count, skipped_count = transform_and_write(
-                blob, batch, source["min_zoom"], source["max_zoom"], profile, connection,
-                args.report_interval)
+        results_per_profile = run_transform(
+            blob, batch, source["min_zoom"], source["max_zoom"], profiles, args)
+        for i, (results, connection) in enumerate(zip(results_per_profile, connections)):
+            written_count, skipped_count = write_output_tiles(results, connection)
             written[i] += written_count
             skipped[i] += skipped_count
 
