@@ -103,12 +103,14 @@ def estimate_tile_at_offset(batch_entries_by_offset, offsets, position):
     return tileid_to_zxy(batch_entries_by_offset[index].tile_id)
 
 
-# Retries for two transient, non-fatal response shapes from the CDN, both
+# Retries for transient, non-fatal failure modes talking to the CDN, mostly
 # seen under many concurrent workers hitting a freshly-published archive at
 # once (cold-cache stampede): a full 200 instead of a 206 (server ignored
-# the Range header), or a 429/5xx (server rate-limiting or buckling under
-# the burst). Neither is a permanent per-request failure, so both are worth
-# a few backed-off retries before giving up for good.
+# the Range header), a 429/5xx (server rate-limiting or buckling under the
+# burst), or the connection dropping mid-stream on a batch large enough to
+# take a while to download. None of these is a permanent per-request
+# failure, so all are worth a few backed-off retries before giving up for
+# good.
 MAX_RANGE_ATTEMPTS = 6
 RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -116,10 +118,22 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 def _wait_before_retry(attempt, response, retry_log, reason=""):
     delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
-    print(f"got {response.status_code}{reason} "
+    label = f"{response.status_code}{reason}"
+    print(f"got {label} "
           f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    retry_log.append((response.status_code, attempt, delay))
+    retry_log.append((label, attempt, delay))
     response.close()
+    time.sleep(delay)
+
+
+def _wait_before_retry_after_stream_error(attempt, error, downloaded, retry_log):
+    # No response to read a Retry-After header from (the connection already
+    # broke), so back off using jitter alone.
+    delay = backoff_delay(attempt, None, RANGE_RETRY_BASE_DELAY)
+    label = f"connection dropped after {downloaded} bytes ({error.__class__.__name__})"
+    print(f"{label} "
+          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
+    retry_log.append((label, attempt, delay))
     time.sleep(delay)
 
 
@@ -148,14 +162,23 @@ def _fetch_batch_streaming_attempt(session, url, range_header, batch_offset, bat
 
         chunks = []
         downloaded = 0
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            downloaded += len(chunk)
-            tile = estimate_tile_at_offset(batch_entries, offsets, batch_offset + downloaded)
-            download_progress.add(len(chunk), tile)
-        return b"".join(chunks)
+        try:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                downloaded += len(chunk)
+                tile = estimate_tile_at_offset(batch_entries, offsets, batch_offset + downloaded)
+                download_progress.add(len(chunk), tile)
+            return b"".join(chunks)
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as error:
+            # The CDN connection can drop mid-stream on a batch this large
+            # (seen as an IncompleteRead well past the halfway point); worth
+            # a few backed-off retries before giving up, same as a bad status.
+            if attempt == MAX_RANGE_ATTEMPTS:
+                raise
+            _wait_before_retry_after_stream_error(attempt, error, downloaded, retry_log)
+            return None
 
 
 def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, download_progress,
@@ -369,8 +392,8 @@ def write_retry_summary(worker_index, retry_log):
         return
     with open(summary_path, "a") as file:
         file.write(f"### worker {worker_index}: {len(retry_log)} retry(ies) needed\n")
-        for status_code, attempt, delay in retry_log:
-            file.write(f"- got HTTP {status_code} instead of 206 on attempt "
+        for label, attempt, delay in retry_log:
+            file.write(f"- got {label} on attempt "
                        f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s\n")
 
 

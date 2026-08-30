@@ -2,6 +2,8 @@ import random
 
 
 def _server_requested_delay(response):
+    if response is None:
+        return None
     retry_after = response.headers.get("Retry-After")
     if retry_after is None:
         return None
