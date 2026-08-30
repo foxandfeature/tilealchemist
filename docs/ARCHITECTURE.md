@@ -107,10 +107,10 @@ task per chunk; each task reloads its profiles from their own `--profile`
 paths rather than receiving live instances (profiles loaded via
 `load_profile()`'s `importlib.util.spec_from_file_location()` aren't
 registered in `sys.modules`, so the default pickler used to hand work to a
-pool worker can't reconstruct them there). See
-`tests/test_low_zoom_regression.py` for a real-data (low zoom, so it stays
-fast) regression check that both of these changes produce identical output
-to the old per-profile, single-process behavior.
+pool worker can't reconstruct them there). `tests/test_low_zoom_regression.py`
+(run on every push/PR via `.github/workflows/test.yml`) checks both of these
+changes against real OpenFreeMap data at low zoom, confirming identical
+output to the old per-profile, single-process behavior.
 
 ## Publishing
 

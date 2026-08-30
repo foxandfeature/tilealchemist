@@ -1,0 +1,30 @@
+name: Test
+
+# Real-world regression check for tilealchemist itself (not a profile build):
+# runs tests/test_low_zoom_regression.py, which fetches real OpenFreeMap data
+# but bounded to low zoom levels, so it stays fast enough to run on every
+# push/PR instead of needing a full multi-hour production run. See that
+# script's own docstring and docs/ARCHITECTURE.md "Parallelism" for what it
+# checks (decode/water-union sharing between profiles, --transform-workers).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  low-zoom-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tilealchemist + profile dependencies
+        run: |
+          pip install .
+          pip install -r tilealchemist/profiles/requirements.txt
+
+      - name: Run low-zoom regression test
+        run: python3 tests/test_low_zoom_regression.py

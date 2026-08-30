@@ -4,12 +4,12 @@ profiles (tilealchemist/mvt.py, tilealchemist/water.py, build_shard.py's
 merged entries-outer/profiles-inner transform loop) and the transform-phase
 process pool (--transform-workers).
 
-Not part of a per-push CI suite: needs real network access to OpenFreeMap
-and takes a few minutes, since a full pipeline run is multi-hour. Bounded to
-low zoom levels instead of synthetic fixtures, so it exercises real OSM
-geometry (the kind of GEOS edge case land.py/cropped_waterways.py were
-already hardened against) rather than hand-built polygons that are unlikely
-to reproduce those bugs.
+Runs on every push/PR (see .github/workflows/test.yml) despite needing real
+network access to OpenFreeMap, since it's bounded to low zoom levels (a few
+minutes) rather than a full multi-hour production run. Deliberately exercises
+real OSM geometry instead of synthetic fixtures, so it can catch the kind of
+GEOS edge case land.py/cropped_waterways.py were already hardened against -
+the sort of thing hand-built polygons are unlikely to reproduce.
 
 Runs prepare-shards once at a low --max-zoom, then build-shard several times
 against that one fetched manifest, diffing the resulting .mbtiles tile
