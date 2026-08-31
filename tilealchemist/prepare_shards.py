@@ -137,8 +137,8 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
                 entries.append(entry)
 
         if throttle.due():
-            print(f"walked {dirs_walked} directories, {len(entries)} entries so far",
-                  file=sys.stderr)
+            print(f"decoded {dirs_walked} directories, {len(entries)} entries so far "
+                  f"(local, no network - the index is already in memory)", file=sys.stderr)
 
     return entries
 
@@ -153,6 +153,8 @@ def collect_entries(session, url, min_zoom, max_zoom):
 
     index_start = header["root_offset"]
     index_end = header["leaf_directory_offset"] + header["leaf_directory_length"]
+    print(f"fetching directory index ({(index_end - index_start) / 1e6:.0f}MB: root "
+          f"directory + every leaf directory) as a single request", file=sys.stderr)
     index_blob = fetch_range(session, url, index_start, index_end - index_start)
 
     root_directory = deserialize_directory(index_blob[:header["root_length"]])
