@@ -264,39 +264,47 @@ TRANSFORM_CHUNKS_PER_WORKER = 8
 
 def _chunk_entries(real_entries, transform_workers):
     """Split real_entries into contiguous, ordered chunks sized by
-    cumulative entry.length (compressed source bytes - a far better proxy
-    for decode/transform cost than entry count), targeting
-    TRANSFORM_CHUNKS_PER_WORKER chunks per worker process so free processes
-    can pull more work instead of idling (see run_transform()).
+    cumulative entry.run_length (the number of (zoom, x, y) output tiles a
+    chunk will produce), not entry.length (compressed source bytes):
+    decode/transform is paid once per entry regardless of run_length, and
+    how many bytes that one decode touches varies independently of it - a
+    duplicated tile can be a few hundred bytes with a run_length in the
+    thousands, while a unique, richly-detailed tile can be tens of
+    kilobytes with run_length 1. Balancing on bytes let one real chunk end
+    up with barely 1,000 entries while a same-sized-in-bytes neighbor held
+    over 170,000 - a ~170x swing in decode/write work between two chunks
+    meant to be equal, which starved a worker's memory (see
+    prepare_shards.py's partition_contiguous(), which had the same problem
+    one level up). Targets TRANSFORM_CHUNKS_PER_WORKER chunks per worker
+    process so free processes can pull more work instead of idling (see
+    run_transform()).
 
     Contiguity and original order are load-bearing: _blob_slice_for_chunk()
     slices one byte range per chunk, and transform_batch_blob_multi()'s
     consecutive-entry dedup only looks at the previous entry (a dedup pair
     split across a chunk boundary just misses that one dedup, which is
-    harmless - and inflates that chunk's byte estimate slightly, since the
-    dedup'd bytes are counted twice though transformed once; not worth
-    correcting for a bounded, rare skew).
+    harmless).
 
     transform_workers <= 1, or fewer than 2 entries, returns a single
     chunk, keeping --transform-workers 1 on run_transform()'s inline,
-    no-pool path exactly as before. A single oversized entry (length alone
-    >= target) simply closes its own chunk immediately, so chunk count is
-    bounded by transform_workers * TRANSFORM_CHUNKS_PER_WORKER + 1 as well
-    as by len(real_entries) - high entry.length variance can only shrink
-    chunk count below that, never explode it."""
+    no-pool path exactly as before. A single entry whose own run_length
+    alone >= target simply closes its own chunk immediately, so chunk
+    count is bounded by transform_workers * TRANSFORM_CHUNKS_PER_WORKER + 1
+    as well as by len(real_entries) - high run_length variance can only
+    shrink chunk count below that, never explode it."""
     if transform_workers <= 1 or len(real_entries) <= 1:
         return [real_entries]
     chunk_target = transform_workers * TRANSFORM_CHUNKS_PER_WORKER
-    total_bytes = sum(entry.length for entry in real_entries)
-    target_bytes = max(1, total_bytes // chunk_target)
+    total_tiles = sum(entry.run_length for entry in real_entries)
+    target_tiles = max(1, total_tiles // chunk_target)
     chunks = []
-    chunk, chunk_bytes = [], 0
+    chunk, chunk_tiles = [], 0
     for entry in real_entries:
         chunk.append(entry)
-        chunk_bytes += entry.length
-        if chunk_bytes >= target_bytes:
+        chunk_tiles += entry.run_length
+        if chunk_tiles >= target_tiles:
             chunks.append(chunk)
-            chunk, chunk_bytes = [], 0
+            chunk, chunk_tiles = [], 0
     if chunk:
         chunks.append(chunk)
     return chunks
@@ -331,7 +339,7 @@ def _transform_chunk(profile_paths, schema_name, min_zoom, max_zoom, blob_slice,
     return transform_batch_blob_multi(blob_slice, batch, min_zoom, max_zoom, _NullProgress(), profiles)
 
 
-def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
+def run_transform(blob, batch, min_zoom, max_zoom, profiles, connections, args):
     """Runs the transform phase either inline (today's behavior, and always
     used for a single chunk, including --transform-workers 1) or fanned out
     across a fixed-size process pool. Chunk count is deliberately larger
@@ -342,20 +350,40 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
     delays only itself rather than stranding cores that already finished.
     The CPU-bound part (decode, transform, encode) is what benefits from
     more cores; the network fetch that produced `blob` already happened
-    once, sequentially, before this is called."""
+    once, sequentially, before this is called.
+
+    Each chunk's results are written to `connections` (one per profile,
+    matched by position) as soon as that chunk is ready, instead of being
+    collected into one big list per profile across every chunk first: a
+    worker with millions of real entries would otherwise hold its entire
+    shard's transformed output in memory for the whole transform phase,
+    which is exactly what ran a worker out of memory in production (see
+    prepare_shards.py's partition_contiguous() and _chunk_entries() above
+    for the matching balancing fix). Peak memory this way is bounded by
+    however many chunks are in flight at once, not by the shard's total
+    size. Returns (written, skipped) counts per profile, summed across all
+    chunks."""
     batch_offset, _batch_length, real_entries = batch
     chunks = _chunk_entries(real_entries, args.transform_workers)
     profile_names = ", ".join(repr(profile.name) for profile in profiles)
+    written = [0] * len(profiles)
+    skipped = [0] * len(profiles)
+
+    def record(chunk_results):
+        for i, (profile_results, connection) in enumerate(zip(chunk_results, connections)):
+            chunk_written, chunk_skipped = write_output_tiles(profile_results, connection)
+            written[i] += chunk_written
+            skipped[i] += chunk_skipped
 
     if len(chunks) <= 1:
         print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries)",
               file=sys.stderr)
         transform_progress = TransformProgress(len(real_entries), args.report_interval)
-        return transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles)
+        record(transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles))
+        return written, skipped
 
     print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries, "
           f"{len(chunks)} chunks across up to {args.transform_workers} processes)", file=sys.stderr)
-    results_per_profile = [[] for _ in profiles]
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.transform_workers) as executor:
         futures = {}
         for index, chunk in enumerate(chunks):
@@ -366,12 +394,10 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
             futures[future] = (index, len(chunk), len(blob_slice))
         for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
             index, entry_count, byte_count = futures[future]
-            chunk_results = future.result()
-            for profile_results, chunk_profile_results in zip(results_per_profile, chunk_results):
-                profile_results.extend(chunk_profile_results)
+            record(future.result())
             print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
                   f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)
-    return results_per_profile
+    return written, skipped
 
 
 def init_mbtiles(path, min_zoom, max_zoom, profile):
@@ -561,12 +587,11 @@ def main():
     # against the same fetched bytes (see run_transform()/transform_batch_blob_multi()).
     if real_entries:
         blob, batch = fetch_real_entries_blob(real_entries, args, source)
-        results_per_profile = run_transform(
-            blob, batch, source["min_zoom"], source["max_zoom"], profiles, args)
-        for i, (results, connection) in enumerate(zip(results_per_profile, connections)):
-            written_count, skipped_count = write_output_tiles(results, connection)
-            written[i] += written_count
-            skipped[i] += skipped_count
+        real_written, real_skipped = run_transform(
+            blob, batch, source["min_zoom"], source["max_zoom"], profiles, connections, args)
+        for i in range(len(profiles)):
+            written[i] += real_written[i]
+            skipped[i] += real_skipped[i]
 
     # Gap entries: no fetch needed, just write whatever each profile fills gaps with.
     if gap_entries:

@@ -222,31 +222,37 @@ def partition_by_index(entries, worker_count):
 
 def partition_contiguous(entries, worker_count):
     """Splits `entries` (sorted by offset) into `worker_count` contiguous
-    blocks of about total_length/W *bytes* each, not entry_count/W
-    *entries* each: entries vary a lot in size (e.g. a dense city tile vs.
-    a small rural one), and both fetch time (one Range GET spanning a
-    worker's whole block) and transform time correlate far more closely
-    with bytes than with entry count. It's only "about" because a whole
-    run of same-offset entries always goes to one worker, even past the
-    target size (see README.md "Fetching")."""
+    blocks of about total_tile_count/W *output tiles* each (summing every
+    entry's run_length), not total_length/W *bytes* and not entry_count/W
+    *entries* either: an entry's run_length is exactly how many (zoom, x,
+    y) tiles - and so how much fetch-then-transform work and how many DB
+    rows - a worker ends up with, and it tracks neither bytes nor raw
+    entry count. Two same-byte-length entries can be a duplicated blank
+    tile with run_length in the thousands and a unique, richly-detailed
+    tile with run_length 1; balancing on bytes alone let one real run
+    assign a worker 3.5M real entries against its peers' 500K-900K (near
+    identical download size, ~5x the transform+write work), which
+    reliably ran that worker out of memory. It's only "about" because a
+    whole run of same-offset entries always goes to one worker, even past
+    the target size (see README.md "Fetching")."""
     entry_count = len(entries)
-    total_length = sum(entry.length for entry in entries)
+    total_tiles = sum(entry.run_length for entry in entries)
     blocks = [[] for _ in range(worker_count)]
     if entry_count == 0:
         return blocks
     worker = 0
     index = 0
-    cumulative_length = 0
+    cumulative_tiles = 0
     while index < entry_count:
         run_end = index + 1
         while run_end < entry_count and entries[run_end].offset == entries[index].offset:
             run_end += 1
         run = entries[index:run_end]
         blocks[worker].extend(run)
-        cumulative_length += sum(entry.length for entry in run)
+        cumulative_tiles += sum(entry.run_length for entry in run)
         index = run_end
-        target_bytes = total_length * (worker + 1) // worker_count
-        if cumulative_length >= target_bytes and worker < worker_count - 1:
+        target_tiles = total_tiles * (worker + 1) // worker_count
+        if cumulative_tiles >= target_tiles and worker < worker_count - 1:
             worker += 1
     return blocks
 
