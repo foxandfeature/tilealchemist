@@ -102,9 +102,18 @@ Independently of that, the transform phase itself (decode, transform,
 encode, sqlite insert - all CPU-bound, not network) can now fan out across a
 worker's own CPU cores via `--transform-workers` (default: all available
 cores; `1` disables pooling and matches the old single-process behavior
-exactly). `real_entries` is split into contiguous chunks, one process pool
-task per chunk; each task reloads its profiles from their own `--profile`
-paths rather than receiving live instances (profiles loaded via
+exactly). `real_entries` is split into contiguous chunks sized by
+cumulative source-tile bytes (`entry.length`) rather than by entry count,
+deliberately producing several times more chunks than there are processes
+(`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter: transform cost
+tracks tile content, not entry count - equal entry counts have finished
+tens of minutes apart in production - so byte-weighted chunks start out
+closer to equal cost, and having more chunks than processes turns
+`ProcessPoolExecutor`'s own call queue into a work queue, where a process
+that finishes early pulls the next pending chunk instead of idling while
+one unlucky core grinds through a dense coastline. Each task reloads its
+profiles from their own `--profile` paths rather than receiving live
+instances (profiles loaded via
 `load_profile()`'s `importlib.util.spec_from_file_location()` aren't
 registered in `sys.modules`, so the default pickler used to hand work to a
 pool worker can't reconstruct them there). `tests/test_low_zoom_regression.py`

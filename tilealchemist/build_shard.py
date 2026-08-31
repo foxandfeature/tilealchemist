@@ -247,15 +247,58 @@ class _NullProgress:
         pass
 
 
+# How many transform chunks to create per worker process. One chunk per
+# process (today's behavior) leaves no room to rebalance: real runs showed
+# four chunks with near-identical entry counts (269648/269648/269648/269645)
+# finishing 2m17s, then +9m15s, then +17m9s apart, because CPU cost per tile
+# tracks tile content (dense coastline vs. open ocean), not entry count.
+# Submitting several smaller chunks per process lets ProcessPoolExecutor's
+# own call queue hand the next pending chunk to whichever process frees up
+# first, bounding the idle tail to roughly one chunk. 8 is high enough that
+# the tail is ~1/8 of a process's share, low enough that per-chunk overhead
+# (one profile reimport, one blob-slice pickle) stays noise against
+# multi-minute chunks.
+TRANSFORM_CHUNKS_PER_WORKER = 8
+
+
 def _chunk_entries(real_entries, transform_workers):
-    """Split real_entries into up to `transform_workers` contiguous, ordered
-    chunks (order matters for the consecutive-entry dedup in
-    transform_batch_blob_multi(); a dedup pair split across a chunk boundary
-    just misses that one dedup, which is harmless). Always at least 1 chunk,
-    never more chunks than entries."""
-    chunk_count = max(1, min(transform_workers, len(real_entries)))
-    chunk_size = -(-len(real_entries) // chunk_count)  # ceil division
-    return [real_entries[i:i + chunk_size] for i in range(0, len(real_entries), chunk_size)]
+    """Split real_entries into contiguous, ordered chunks sized by
+    cumulative entry.length (compressed source bytes - a far better proxy
+    for decode/transform cost than entry count), targeting
+    TRANSFORM_CHUNKS_PER_WORKER chunks per worker process so free processes
+    can pull more work instead of idling (see run_transform()).
+
+    Contiguity and original order are load-bearing: _blob_slice_for_chunk()
+    slices one byte range per chunk, and transform_batch_blob_multi()'s
+    consecutive-entry dedup only looks at the previous entry (a dedup pair
+    split across a chunk boundary just misses that one dedup, which is
+    harmless - and inflates that chunk's byte estimate slightly, since the
+    dedup'd bytes are counted twice though transformed once; not worth
+    correcting for a bounded, rare skew).
+
+    transform_workers <= 1, or fewer than 2 entries, returns a single
+    chunk, keeping --transform-workers 1 on run_transform()'s inline,
+    no-pool path exactly as before. A single oversized entry (length alone
+    >= target) simply closes its own chunk immediately, so chunk count is
+    bounded by transform_workers * TRANSFORM_CHUNKS_PER_WORKER + 1 as well
+    as by len(real_entries) - high entry.length variance can only shrink
+    chunk count below that, never explode it."""
+    if transform_workers <= 1 or len(real_entries) <= 1:
+        return [real_entries]
+    chunk_target = transform_workers * TRANSFORM_CHUNKS_PER_WORKER
+    total_bytes = sum(entry.length for entry in real_entries)
+    target_bytes = max(1, total_bytes // chunk_target)
+    chunks = []
+    chunk, chunk_bytes = [], 0
+    for entry in real_entries:
+        chunk.append(entry)
+        chunk_bytes += entry.length
+        if chunk_bytes >= target_bytes:
+            chunks.append(chunk)
+            chunk, chunk_bytes = [], 0
+    if chunk:
+        chunks.append(chunk)
+    return chunks
 
 
 def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
@@ -264,7 +307,7 @@ def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
     `entry.offset - chunk's own batch_offset` arithmetic
     transform_batch_blob_multi() already does, without needing the full blob
     (keeps the amount of data pickled to each worker process proportional to
-    that worker's own chunk, not the whole batch)."""
+    that chunk, not the whole batch)."""
     chunk_offset = chunk_entries[0].offset
     end = max(entry.offset + entry.length for entry in chunk_entries)
     return blob[chunk_offset - batch_offset:end - batch_offset], chunk_offset
@@ -289,10 +332,16 @@ def _transform_chunk(profile_paths, schema_name, min_zoom, max_zoom, blob_slice,
 
 def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
     """Runs the transform phase either inline (today's behavior, and always
-    used for a single chunk) or fanned out across a process pool, one chunk
-    of real_entries per process. The CPU-bound part (decode, transform,
-    encode) is what benefits from more cores; the network fetch that produced
-    `blob` already happened once, sequentially, before this is called."""
+    used for a single chunk, including --transform-workers 1) or fanned out
+    across a fixed-size process pool. Chunk count is deliberately larger
+    than the process count: ProcessPoolExecutor's internal call queue is
+    itself the work queue - its manager thread keeps only a couple of
+    submitted calls in flight per process and hands each remaining chunk to
+    whichever worker returns first, so a chunk that turns out expensive
+    delays only itself rather than stranding cores that already finished.
+    The CPU-bound part (decode, transform, encode) is what benefits from
+    more cores; the network fetch that produced `blob` already happened
+    once, sequentially, before this is called."""
     batch_offset, _batch_length, real_entries = batch
     chunks = _chunk_entries(real_entries, args.transform_workers)
     profile_names = ", ".join(repr(profile.name) for profile in profiles)
@@ -306,20 +355,21 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
     print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries, "
           f"{len(chunks)} chunks across up to {args.transform_workers} processes)", file=sys.stderr)
     results_per_profile = [[] for _ in profiles]
-    with concurrent.futures.ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.transform_workers) as executor:
         futures = {}
         for index, chunk in enumerate(chunks):
             blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
             future = executor.submit(
                 _transform_chunk, args.profile, args.schema, min_zoom, max_zoom,
                 blob_slice, blob_slice_offset, chunk)
-            futures[future] = (index, len(chunk))
-        for future in concurrent.futures.as_completed(futures):
-            index, entry_count = futures[future]
+            futures[future] = (index, len(chunk), len(blob_slice))
+        for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            index, entry_count, byte_count = futures[future]
             chunk_results = future.result()
             for profile_results, chunk_profile_results in zip(results_per_profile, chunk_results):
                 profile_results.extend(chunk_profile_results)
-            print(f"chunk {index + 1}/{len(chunks)} done ({entry_count} entries)", file=sys.stderr)
+            print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
+                  f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)
     return results_per_profile
 
 
