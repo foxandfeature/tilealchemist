@@ -9,7 +9,6 @@ tilealchemist/sources/ for how the archive URL itself gets resolved.
         --out-dir manifests/
 """
 import argparse
-import concurrent.futures
 import json
 import os
 import sys
@@ -28,11 +27,16 @@ from tilealchemist.throttle import UpdateLineThrottle
 # must stay at 30 or below.
 MAX_SUPPORTED_ZOOM = 30
 
-# Latency-bound tiny fetches, so concurrency helps. It's kept well below
-# --worker-count (default 128) so this one-time walk doesn't add extra load
-# on top of the much larger per-shard fetch fan-out that follows, on
-# OpenFreeMap's single free community-run server.
-WALK_WORKER_COUNT = 32
+# root_offset..root_offset+root_length (root directory), metadata, and
+# leaf_directory_offset..+leaf_directory_length (every non-root directory
+# node, however deep the tree goes) are packed back-to-back with no gaps -
+# writers lay the file out Header/Root/Metadata/LeafDirs/TileData in that
+# order - and leaf_directory_offset/leaf_directory_length are already known
+# from the 127-byte header alone. So the whole index (root + every leaf
+# directory) can be pulled down as a single Range request instead of one
+# tiny latency-bound request per node discovered while walking (thousands of
+# them on a full planet archive), and the tree then walked/pruned entirely
+# from that in-memory buffer with zero further network requests.
 WALK_LOG_INTERVAL = 5.0
 
 # Retries handle two transient cold-cache-stampede responses: a 200 instead
@@ -45,10 +49,9 @@ RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def make_session(pool_size):
+def make_session():
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        max_retries=3, pool_connections=pool_size, pool_maxsize=pool_size)
+    adapter = requests.adapters.HTTPAdapter(max_retries=3)
     session.mount("https://", adapter)
     return session
 
@@ -101,73 +104,63 @@ def fetch_range(session, url, offset, length):
             return result
 
 
-def fetch_directory_node(session, url, header, node_offset, node_length,
-                          tile_id_start, tile_id_limit):
-    """Prunes at both ends of tile-ID space, symmetric to how the upper
-    (max_zoom) bound already worked before min_zoom existed: sibling entries
-    in a directory are sorted and non-overlapping, so an entry's own tile_id
-    is the minimum tile_id anywhere in its subtree, and the next sibling's
-    tile_id (or tile_id_limit, past the last sibling) is an upper bound on
-    it. That's enough to decide "entirely below tile_id_start" or "entirely
-    at/above tile_id_limit" without ever fetching the subtree, so min_zoom
-    shrinks the walk itself instead of just filtering its result."""
-    data = fetch_range(session, url, node_offset, node_length)
-    directory = deserialize_directory(data)
-    terminal_entries = []
-    child_pointers = []
-    for index, entry in enumerate(directory):
-        if entry.tile_id >= tile_id_limit:
-            break
-        if entry.run_length == 0:
-            next_tile_id = (directory[index + 1].tile_id if index + 1 < len(directory)
-                             else tile_id_limit)
-            if next_tile_id > tile_id_start:
-                child_pointers.append((header["leaf_directory_offset"] + entry.offset, entry.length))
-        elif entry.tile_id + entry.run_length > tile_id_start:
-            terminal_entries.append(entry)
-    return terminal_entries, child_pointers
-
-
-def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit):
-    """Workers return their results instead of submitting new work
-    themselves, to avoid deadlocking this bounded pool via recursive
-    submission."""
+def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit):
+    """Purely local now that every node's bytes are already in memory
+    (root_directory decoded up front, the rest sliced out of leaf_blob): no
+    more network fan-out here, just decoding and the same tile-ID pruning
+    as before. Prunes at both ends of tile-ID space, symmetric to how the
+    upper (max_zoom) bound already worked before min_zoom existed: sibling
+    entries in a directory are sorted and non-overlapping, so an entry's own
+    tile_id is the minimum tile_id anywhere in its subtree, and the next
+    sibling's tile_id (or tile_id_limit, past the last sibling) is an upper
+    bound on it. That's enough to decide "entirely below tile_id_start" or
+    "entirely at/above tile_id_limit" without ever decoding the subtree, so
+    min_zoom shrinks the walk itself instead of just filtering its result."""
     entries = []
     dirs_walked = 0
     throttle = UpdateLineThrottle(WALK_LOG_INTERVAL)
-    frontier = [(header["root_offset"], header["root_length"])]
-    pending = set()
+    frontier = [root_directory]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WALK_WORKER_COUNT) as executor:
-        while frontier or pending:
-            while frontier and len(pending) < WALK_WORKER_COUNT:
-                node_offset, node_length = frontier.pop()
-                pending.add(executor.submit(
-                    fetch_directory_node, session, url, header,
-                    node_offset, node_length, tile_id_start, tile_id_limit))
+    while frontier:
+        directory = frontier.pop()
+        dirs_walked += 1
+        for index, entry in enumerate(directory):
+            if entry.tile_id >= tile_id_limit:
+                break
+            if entry.run_length == 0:
+                next_tile_id = (directory[index + 1].tile_id if index + 1 < len(directory)
+                                 else tile_id_limit)
+                if next_tile_id > tile_id_start:
+                    node_bytes = leaf_blob[entry.offset:entry.offset + entry.length]
+                    frontier.append(deserialize_directory(node_bytes))
+            elif entry.tile_id + entry.run_length > tile_id_start:
+                entries.append(entry)
 
-            done, pending = concurrent.futures.wait(
-                pending, return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                terminal_entries, child_pointers = future.result()
-                entries.extend(terminal_entries)
-                frontier.extend(child_pointers)
-                dirs_walked += 1
-
-            if throttle.due():
-                print(f"walked {dirs_walked} directories, {len(entries)} entries so far "
-                      f"(in flight: {len(pending)})", file=sys.stderr)
+        if throttle.due():
+            print(f"walked {dirs_walked} directories, {len(entries)} entries so far",
+                  file=sys.stderr)
 
     return entries
 
 
 def collect_entries(session, url, min_zoom, max_zoom):
     """All directory entries covering min_zoom..max_zoom, in ascending
-    *offset* order (see README.md "Fetching" for why offset order)."""
+    *offset* order (see README.md "Fetching" for why offset order). Only 2
+    requests total: the header, then one Range request spanning root
+    directory + metadata + every leaf directory (see the comment above
+    WALK_LOG_INTERVAL for why that's safe to fetch as one contiguous span)."""
     header = deserialize_header(fetch_range(session, url, 0, 127))
+
+    index_start = header["root_offset"]
+    index_end = header["leaf_directory_offset"] + header["leaf_directory_length"]
+    index_blob = fetch_range(session, url, index_start, index_end - index_start)
+
+    root_directory = deserialize_directory(index_blob[:header["root_length"]])
+    leaf_blob = index_blob[header["leaf_directory_offset"] - index_start:]
+
     tile_id_start = zxy_to_tileid(min_zoom, 0, 0) if min_zoom > 0 else 0
     tile_id_limit = zxy_to_tileid(max_zoom + 1, 0, 0)
-    entries = walk_directory_tree(session, url, header, tile_id_start, tile_id_limit)
+    entries = walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     entries.sort(key=lambda entry: entry.offset)
     return header, entries
 
@@ -298,7 +291,7 @@ def main():
     print(f"source={url} (build {timestamp})", file=sys.stderr)
 
     # one-time directory walk
-    session = make_session(WALK_WORKER_COUNT)
+    session = make_session()
     header, entries = collect_entries(session, url, args.min_zoom, args.max_zoom)
     print(f"directory walk found {len(entries)} distinct tile entries "
           f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})", file=sys.stderr)
