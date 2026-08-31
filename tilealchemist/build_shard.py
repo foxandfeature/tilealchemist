@@ -117,36 +117,37 @@ RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def _wait_before_retry(attempt, response, retry_log, reason=""):
+def _wait_before_retry(worker_index, attempt, response, reason=""):
+    """Prints the retry directly as a `::warning::` workflow command (rather
+    than a plain line now and a replayed `::warning::` later) so a run that
+    hit the OpenFreeMap CDN's cold-cache stampede shows up as an actual
+    warning status in the Actions UI as it happens, with no duplicate line."""
     delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
-    label = f"{response.status_code}{reason}"
-    print(f"got {label} "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    retry_log.append((label, attempt, delay))
+    print(f"::warning title=worker {worker_index} retry::got {response.status_code}{reason} "
+          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s")
     response.close()
     time.sleep(delay)
 
 
-def _wait_before_retry_after_stream_error(attempt, error, downloaded, retry_log):
+def _wait_before_retry_after_stream_error(worker_index, attempt, error, downloaded):
     # No response to read a Retry-After header from (the connection already
     # broke), so back off using jitter alone.
     delay = backoff_delay(attempt, None, RANGE_RETRY_BASE_DELAY)
-    label = f"connection dropped after {downloaded} bytes ({error.__class__.__name__})"
-    print(f"{label} "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    retry_log.append((label, attempt, delay))
+    print(f"::warning title=worker {worker_index} retry::connection dropped after "
+          f"{downloaded} bytes ({error.__class__.__name__}) "
+          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s")
     time.sleep(delay)
 
 
 def _fetch_batch_streaming_attempt(session, url, range_header, batch_offset, batch_entries, offsets,
-                                    download_progress, attempt, retry_log, chunk_size):
+                                    download_progress, attempt, worker_index, chunk_size):
     """Returns the downloaded bytes on success, or None if `_wait_before_retry`
     already handled the backoff and the caller should try again."""
     with session.get(url, headers={"Range": range_header}, timeout=300, stream=True) as response:
         if response.status_code in RETRYABLE_STATUS_CODES:
             if attempt == MAX_RANGE_ATTEMPTS:
                 response.raise_for_status()
-            _wait_before_retry(attempt, response, retry_log)
+            _wait_before_retry(worker_index, attempt, response)
             return None
 
         response.raise_for_status()
@@ -158,7 +159,7 @@ def _fetch_batch_streaming_attempt(session, url, range_header, batch_offset, bat
                     f"ignored the Range header and would send the entire archive instead of "
                     f"just this batch"
                 )
-            _wait_before_retry(attempt, response, retry_log, reason=" instead of 206")
+            _wait_before_retry(worker_index, attempt, response, reason=" instead of 206")
             return None
 
         chunks = []
@@ -178,12 +179,12 @@ def _fetch_batch_streaming_attempt(session, url, range_header, batch_offset, bat
             # a few backed-off retries before giving up, same as a bad status.
             if attempt == MAX_RANGE_ATTEMPTS:
                 raise
-            _wait_before_retry_after_stream_error(attempt, error, downloaded, retry_log)
+            _wait_before_retry_after_stream_error(worker_index, attempt, error, downloaded)
             return None
 
 
 def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, download_progress,
-                                        retry_log, chunk_size=1024 * 1024):
+                                        worker_index, chunk_size=1024 * 1024):
     batch_offset, batch_length, batch_entries = batch
     abs_offset = tile_data_offset + batch_offset
     offsets = [entry.offset for entry in batch_entries]
@@ -192,7 +193,7 @@ def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, do
     for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
         result = _fetch_batch_streaming_attempt(
             session, url, range_header, batch_offset, batch_entries, offsets,
-            download_progress, attempt, retry_log, chunk_size)
+            download_progress, attempt, worker_index, chunk_size)
         if result is not None:
             return result
 
@@ -462,7 +463,7 @@ def split_manifest_entries(entries):
     return real_entries, gap_entries
 
 
-def fetch_real_entries_blob(real_entries, args, source, retry_log):
+def fetch_real_entries_blob(real_entries, args, source):
     """Single shared network fetch for this worker's real entries, reused by
     every profile in args.profile: the raw bytes don't depend on which
     profile(s) transform them afterward."""
@@ -477,7 +478,8 @@ def fetch_real_entries_blob(real_entries, args, source, retry_log):
     print(f"starting download ({batch_length} bytes, {len(real_entries)} entries)",
           file=sys.stderr)
     blob = fetch_batch_streaming_with_retries(
-        session, source["url"], source["tile_data_offset"], batch, download_progress, retry_log)
+        session, source["url"], source["tile_data_offset"], batch, download_progress,
+        args.worker_index)
     return blob, batch
 
 
@@ -528,15 +530,6 @@ def write_gap_tiles(gap_entries, connection, profile):
     return written, skipped
 
 
-def write_retry_summary(worker_index, retry_log):
-    """Emitted as ::warning:: workflow commands so a run that hit the
-    OpenFreeMap CDN's cold-cache stampede shows up as an actual warning
-    status in the Actions UI, not just buried in the job summary."""
-    for label, attempt, delay in retry_log:
-        print(f"::warning title=worker {worker_index} retry::got {label} on attempt "
-              f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s")
-
-
 def main():
     # Setup: CLI args, source archive info, this worker's assigned entries.
     args = parse_args()
@@ -563,12 +556,11 @@ def main():
 
     written = [0] * len(profiles)
     skipped = [0] * len(profiles)
-    retry_log = []
 
     # Real entries: fetch once, then transform every profile together
     # against the same fetched bytes (see run_transform()/transform_batch_blob_multi()).
     if real_entries:
-        blob, batch = fetch_real_entries_blob(real_entries, args, source, retry_log)
+        blob, batch = fetch_real_entries_blob(real_entries, args, source)
         results_per_profile = run_transform(
             blob, batch, source["min_zoom"], source["max_zoom"], profiles, args)
         for i, (results, connection) in enumerate(zip(results_per_profile, connections)):
@@ -591,8 +583,6 @@ def main():
     for profile, out, written_count, skipped_count in zip(profiles, args.out, written, skipped):
         print(f"done: profile={profile.name} written={written_count} skipped={skipped_count} "
               f"-> {out}", file=sys.stderr)
-
-    write_retry_summary(args.worker_index, retry_log)
 
 
 if __name__ == "__main__":

@@ -53,26 +53,29 @@ def make_session(pool_size):
     return session
 
 
-def _wait_before_retry(attempt, response, range_header, retry_log, reason=""):
+def _wait_before_retry(attempt, response, range_header, reason=""):
+    """Prints the retry directly as a `::warning::` workflow command (rather
+    than a plain line now and a replayed `::warning::` later) so a run that
+    hit the OpenFreeMap CDN's cold-cache stampede shows up as an actual
+    warning status in the Actions UI as it happens, with no duplicate line.
+    Safe to call unprotected from the many concurrent walk threads: CPython
+    serializes the underlying print()."""
     delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
-    print(f"got {response.status_code} for range {range_header}{reason} "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    # list.append() is safe to call from the many concurrent walk threads
-    # unprotected: CPython serializes it under the GIL, and entry order
-    # within the log doesn't matter, only that every retry gets recorded.
-    retry_log.append((response.status_code, attempt, delay, reason))
+    print(f"::warning title=prepare-shards retry::got HTTP {response.status_code}{reason} "
+          f"for range {range_header} (attempt {attempt}/{MAX_RANGE_ATTEMPTS}), "
+          f"retrying in {delay:.0f}s")
     response.close()
     time.sleep(delay)
 
 
-def _fetch_range_attempt(session, url, range_header, attempt, retry_log):
+def _fetch_range_attempt(session, url, range_header, attempt):
     """Returns the response body on success, or None if `_wait_before_retry`
     already handled the backoff and the caller should try again."""
     with session.get(url, headers={"Range": range_header}, timeout=60, stream=True) as response:
         if response.status_code in RETRYABLE_STATUS_CODES:
             if attempt == MAX_RANGE_ATTEMPTS:
                 response.raise_for_status()
-            _wait_before_retry(attempt, response, range_header, retry_log)
+            _wait_before_retry(attempt, response, range_header)
             return None
 
         response.raise_for_status()
@@ -84,22 +87,22 @@ def _fetch_range_attempt(session, url, range_header, attempt, retry_log):
                     f"ignored the Range header and would send the entire archive instead of "
                     f"just this range"
                 )
-            _wait_before_retry(attempt, response, range_header, retry_log, reason=" instead of 206")
+            _wait_before_retry(attempt, response, range_header, reason=" instead of 206")
             return None
 
         return response.content
 
 
-def fetch_range(session, url, offset, length, retry_log):
+def fetch_range(session, url, offset, length):
     range_header = f"bytes={offset}-{offset + length - 1}"
     for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
-        result = _fetch_range_attempt(session, url, range_header, attempt, retry_log)
+        result = _fetch_range_attempt(session, url, range_header, attempt)
         if result is not None:
             return result
 
 
 def fetch_directory_node(session, url, header, node_offset, node_length,
-                          tile_id_start, tile_id_limit, retry_log):
+                          tile_id_start, tile_id_limit):
     """Prunes at both ends of tile-ID space, symmetric to how the upper
     (max_zoom) bound already worked before min_zoom existed: sibling entries
     in a directory are sorted and non-overlapping, so an entry's own tile_id
@@ -108,7 +111,7 @@ def fetch_directory_node(session, url, header, node_offset, node_length,
     it. That's enough to decide "entirely below tile_id_start" or "entirely
     at/above tile_id_limit" without ever fetching the subtree, so min_zoom
     shrinks the walk itself instead of just filtering its result."""
-    data = fetch_range(session, url, node_offset, node_length, retry_log)
+    data = fetch_range(session, url, node_offset, node_length)
     directory = deserialize_directory(data)
     terminal_entries = []
     child_pointers = []
@@ -125,7 +128,7 @@ def fetch_directory_node(session, url, header, node_offset, node_length,
     return terminal_entries, child_pointers
 
 
-def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retry_log):
+def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit):
     """Workers return their results instead of submitting new work
     themselves, to avoid deadlocking this bounded pool via recursive
     submission."""
@@ -141,7 +144,7 @@ def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retr
                 node_offset, node_length = frontier.pop()
                 pending.add(executor.submit(
                     fetch_directory_node, session, url, header,
-                    node_offset, node_length, tile_id_start, tile_id_limit, retry_log))
+                    node_offset, node_length, tile_id_start, tile_id_limit))
 
             done, pending = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -158,13 +161,13 @@ def walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retr
     return entries
 
 
-def collect_entries(session, url, min_zoom, max_zoom, retry_log):
+def collect_entries(session, url, min_zoom, max_zoom):
     """All directory entries covering min_zoom..max_zoom, in ascending
     *offset* order (see README.md "Fetching" for why offset order)."""
-    header = deserialize_header(fetch_range(session, url, 0, 127, retry_log))
+    header = deserialize_header(fetch_range(session, url, 0, 127))
     tile_id_start = zxy_to_tileid(min_zoom, 0, 0) if min_zoom > 0 else 0
     tile_id_limit = zxy_to_tileid(max_zoom + 1, 0, 0)
-    entries = walk_directory_tree(session, url, header, tile_id_start, tile_id_limit, retry_log)
+    entries = walk_directory_tree(session, url, header, tile_id_start, tile_id_limit)
     entries.sort(key=lambda entry: entry.offset)
     return header, entries
 
@@ -262,16 +265,6 @@ def min_zoom_type(value):
     return zoom
 
 
-def write_retry_summary(retry_log):
-    """Mirrors build_shard.py's write_retry_summary(): emitted as
-    ::warning:: workflow commands so a run that hit the OpenFreeMap CDN's
-    cold-cache stampede shows up as an actual warning status in the Actions
-    UI, not just buried in the job summary."""
-    for status_code, attempt, delay, reason in retry_log:
-        print(f"::warning title=prepare-shards retry::got HTTP {status_code}{reason} on attempt "
-              f"{attempt}/{MAX_RANGE_ATTEMPTS}, retried after {delay:.0f}s")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -289,7 +282,6 @@ def main():
         parser.error(f"--min-zoom ({args.min_zoom}) must not exceed --max-zoom ({args.max_zoom})")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    retry_log = []
 
     # resolve source archive
     resolved = resolve_source(args.source, args.source_url).resolve()
@@ -298,7 +290,7 @@ def main():
 
     # one-time directory walk
     session = make_session(WALK_WORKER_COUNT)
-    header, entries = collect_entries(session, url, args.min_zoom, args.max_zoom, retry_log)
+    header, entries = collect_entries(session, url, args.min_zoom, args.max_zoom)
     print(f"directory walk found {len(entries)} distinct tile entries "
           f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})", file=sys.stderr)
 
@@ -331,8 +323,6 @@ def main():
     non_empty = sum(1 for block in blocks if block)
     print(f"wrote {len(blocks)} manifests to {args.out_dir} "
           f"({non_empty} non-empty)", file=sys.stderr)
-
-    write_retry_summary(retry_log)
 
 
 if __name__ == "__main__":
