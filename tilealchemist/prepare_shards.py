@@ -5,7 +5,7 @@ see `compute_gaps()`) into `--worker-count` contiguous manifests, one per
 worker. See README.md ("Fetching") for why it's structured this way, and
 tilealchemist/sources/ for how the archive URL itself gets resolved.
 
-    tilealchemist-prepare-shards --worker-count 64 --min-zoom 0 --max-zoom 14 \
+    tilealchemist-prepare-shards --worker-count 128 --min-zoom 0 --max-zoom 14 \
         --out-dir manifests/
 """
 import argparse
@@ -29,7 +29,7 @@ from tilealchemist.throttle import UpdateLineThrottle
 MAX_SUPPORTED_ZOOM = 30
 
 # Latency-bound tiny fetches, so concurrency helps. It's kept well below
-# --worker-count (default 64) so this one-time walk doesn't add extra load
+# --worker-count (default 128) so this one-time walk doesn't add extra load
 # on top of the much larger per-shard fetch fan-out that follows, on
 # OpenFreeMap's single free community-run server.
 WALK_WORKER_COUNT = 32
@@ -222,37 +222,40 @@ def partition_by_index(entries, worker_count):
 
 def partition_contiguous(entries, worker_count):
     """Splits `entries` (sorted by offset) into `worker_count` contiguous
-    blocks of about total_tile_count/W *output tiles* each (summing every
-    entry's run_length), not total_length/W *bytes* and not entry_count/W
-    *entries* either: an entry's run_length is exactly how many (zoom, x,
-    y) tiles - and so how much fetch-then-transform work and how many DB
-    rows - a worker ends up with, and it tracks neither bytes nor raw
-    entry count. Two same-byte-length entries can be a duplicated blank
-    tile with run_length in the thousands and a unique, richly-detailed
-    tile with run_length 1; balancing on bytes alone let one real run
-    assign a worker 3.5M real entries against its peers' 500K-900K (near
-    identical download size, ~5x the transform+write work), which
-    reliably ran that worker out of memory. It's only "about" because a
-    whole run of same-offset entries always goes to one worker, even past
-    the target size (see README.md "Fetching")."""
+    blocks of about entry_count/W *entries* each - not total_length/W
+    *bytes* and not total_run_length/W *output tiles* either: decode is
+    paid once per entry no matter its byte length or its run_length, so
+    entry count is what actually tracks how many of those decode calls a
+    worker gets stuck with. Two earlier attempts got this wrong in
+    opposite directions. Balancing on bytes let one real run assign a
+    worker 3.5M real entries against its peers' 500K-900K (near-identical
+    download size, ~5x the decode work), which ran that worker out of
+    memory. Balancing on run_length (total output tiles) made it worse:
+    a handful of entries with a huge run_length "fills" a tile-sized
+    target almost immediately while costing almost no decode work, so
+    regions dense in those pushed every real, unique-content entry
+    (run_length 1, one decode each - and just as many bytes to fetch) onto
+    whatever workers were left, producing a 4.3M-entry/16GB worker next to
+    a 76K-entry/7MB one. It's only "about" because a whole run of
+    same-offset entries always goes to one worker, even past the target
+    size (see README.md "Fetching")."""
     entry_count = len(entries)
-    total_tiles = sum(entry.run_length for entry in entries)
     blocks = [[] for _ in range(worker_count)]
     if entry_count == 0:
         return blocks
     worker = 0
     index = 0
-    cumulative_tiles = 0
+    cumulative_count = 0
     while index < entry_count:
         run_end = index + 1
         while run_end < entry_count and entries[run_end].offset == entries[index].offset:
             run_end += 1
         run = entries[index:run_end]
         blocks[worker].extend(run)
-        cumulative_tiles += sum(entry.run_length for entry in run)
+        cumulative_count += len(run)
         index = run_end
-        target_tiles = total_tiles * (worker + 1) // worker_count
-        if cumulative_tiles >= target_tiles and worker < worker_count - 1:
+        target_count = entry_count * (worker + 1) // worker_count
+        if cumulative_count >= target_count and worker < worker_count - 1:
             worker += 1
     return blocks
 
@@ -274,7 +277,7 @@ def min_zoom_type(value):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--worker-count", type=int, default=64)
+    parser.add_argument("--worker-count", type=int, default=128)
     parser.add_argument("--min-zoom", type=min_zoom_type, default=0)
     parser.add_argument("--max-zoom", type=max_zoom_type, default=14)
     parser.add_argument("--out-dir", required=True)

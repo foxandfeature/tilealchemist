@@ -51,7 +51,7 @@ on:
         description: "How many parallel shard-building jobs to fan out into. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\")."
         required: false
         type: string
-        default: "64"
+        default: "128"
       output_basename:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true

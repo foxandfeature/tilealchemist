@@ -263,21 +263,22 @@ TRANSFORM_CHUNKS_PER_WORKER = 8
 
 
 def _chunk_entries(real_entries, transform_workers):
-    """Split real_entries into contiguous, ordered chunks sized by
-    cumulative entry.run_length (the number of (zoom, x, y) output tiles a
-    chunk will produce), not entry.length (compressed source bytes):
-    decode/transform is paid once per entry regardless of run_length, and
-    how many bytes that one decode touches varies independently of it - a
-    duplicated tile can be a few hundred bytes with a run_length in the
-    thousands, while a unique, richly-detailed tile can be tens of
-    kilobytes with run_length 1. Balancing on bytes let one real chunk end
-    up with barely 1,000 entries while a same-sized-in-bytes neighbor held
-    over 170,000 - a ~170x swing in decode/write work between two chunks
-    meant to be equal, which starved a worker's memory (see
-    prepare_shards.py's partition_contiguous(), which had the same problem
-    one level up). Targets TRANSFORM_CHUNKS_PER_WORKER chunks per worker
-    process so free processes can pull more work instead of idling (see
-    run_transform()).
+    """Split real_entries into contiguous, ordered chunks of about
+    len(real_entries)/(transform_workers*TRANSFORM_CHUNKS_PER_WORKER)
+    *entries* each - not cumulative entry.length (compressed source bytes)
+    and not cumulative entry.run_length (output tile count) either: decode
+    is paid once per entry regardless of its byte length or its
+    run_length, so entry count is what actually tracks how many of those
+    decode calls a chunk gets stuck with. Two earlier attempts got this
+    wrong in opposite directions. Balancing on bytes let one real chunk
+    end up with barely 1,000 entries while a same-sized-in-bytes neighbor
+    held over 170,000. Balancing on run_length made it worse: a handful of
+    entries with a huge run_length "fills" a tile-sized target almost
+    immediately while costing almost no decode work, so real,
+    unique-content entries (run_length 1, one decode each) piled up
+    into far larger chunks than their peers. Targets
+    TRANSFORM_CHUNKS_PER_WORKER chunks per worker process so free
+    processes can pull more work instead of idling (see run_transform()).
 
     Contiguity and original order are load-bearing: _blob_slice_for_chunk()
     slices one byte range per chunk, and transform_batch_blob_multi()'s
@@ -287,24 +288,21 @@ def _chunk_entries(real_entries, transform_workers):
 
     transform_workers <= 1, or fewer than 2 entries, returns a single
     chunk, keeping --transform-workers 1 on run_transform()'s inline,
-    no-pool path exactly as before. A single entry whose own run_length
-    alone >= target simply closes its own chunk immediately, so chunk
-    count is bounded by transform_workers * TRANSFORM_CHUNKS_PER_WORKER + 1
-    as well as by len(real_entries) - high run_length variance can only
-    shrink chunk count below that, never explode it."""
+    no-pool path exactly as before. Chunk count is otherwise exactly
+    ceil(len(real_entries) / target_count), bounded by
+    transform_workers * TRANSFORM_CHUNKS_PER_WORKER (plus at most one
+    partial remainder chunk)."""
     if transform_workers <= 1 or len(real_entries) <= 1:
         return [real_entries]
     chunk_target = transform_workers * TRANSFORM_CHUNKS_PER_WORKER
-    total_tiles = sum(entry.run_length for entry in real_entries)
-    target_tiles = max(1, total_tiles // chunk_target)
+    target_count = max(1, len(real_entries) // chunk_target)
     chunks = []
-    chunk, chunk_tiles = [], 0
+    chunk = []
     for entry in real_entries:
         chunk.append(entry)
-        chunk_tiles += entry.run_length
-        if chunk_tiles >= target_tiles:
+        if len(chunk) >= target_count:
             chunks.append(chunk)
-            chunk, chunk_tiles = [], 0
+            chunk = []
     if chunk:
         chunks.append(chunk)
     return chunks
