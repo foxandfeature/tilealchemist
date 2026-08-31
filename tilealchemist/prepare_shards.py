@@ -66,7 +66,7 @@ def _wait_before_retry(attempt, response, range_header, reason=""):
     delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
     print(f"::warning title=prepare-shards retry::got HTTP {response.status_code}{reason} "
           f"for range {range_header} (attempt {attempt}/{MAX_RANGE_ATTEMPTS}), "
-          f"retrying in {delay:.0f}s")
+          f"retrying in {delay:.0f}s", file=sys.stderr)
     response.close()
     time.sleep(delay)
 

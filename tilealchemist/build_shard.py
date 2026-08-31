@@ -124,7 +124,7 @@ def _wait_before_retry(worker_index, attempt, response, reason=""):
     warning status in the Actions UI as it happens, with no duplicate line."""
     delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
     print(f"::warning title=worker {worker_index} retry::got {response.status_code}{reason} "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s")
+          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
     response.close()
     time.sleep(delay)
 
@@ -135,7 +135,7 @@ def _wait_before_retry_after_stream_error(worker_index, attempt, error, download
     delay = backoff_delay(attempt, None, RANGE_RETRY_BASE_DELAY)
     print(f"::warning title=worker {worker_index} retry::connection dropped after "
           f"{downloaded} bytes ({error.__class__.__name__}) "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s")
+          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
     time.sleep(delay)
 
 
