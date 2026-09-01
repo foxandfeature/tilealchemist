@@ -37,13 +37,15 @@ MAX_SUPPORTED_ZOOM = 30
 # tiny latency-bound request per node discovered while walking (thousands of
 # them on a full planet archive), and the tree then walked/pruned entirely
 # from that in-memory buffer with zero further network requests.
-WALK_LOG_INTERVAL = 5.0
+WALK_LOG_INTERVAL = 1.0
 
 # How often (seconds) the index-download update line is allowed to print.
 # The index fetch is one blocking Range request (see collect_entries()), so
 # unlike WALK_LOG_INTERVAL this is checked from inside the chunked read loop
-# itself - see DownloadProgress.
-DOWNLOAD_LOG_INTERVAL = 5.0
+# itself - see DownloadProgress. Shorter than WALK_LOG_INTERVAL: it's a
+# single network transfer, so a stall is worth surfacing sooner than a slow
+# decode (same reasoning as build_shard.py's DOWNLOAD_REPORT_INTERVAL).
+DOWNLOAD_LOG_INTERVAL = 1.0
 
 # Retries handle two transient cold-cache-stampede responses: a 200 instead
 # of 206 (server ignored Range, the same check as build_shard.py's
@@ -170,13 +172,26 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     entries = []
     dirs_decoded = 1  # root_directory itself, already decoded by the caller
     dirs_popped = 0
+    decoded_bytes = 0
+    total_bytes = len(leaf_blob)
     throttle = UpdateLineThrottle(WALK_LOG_INTERVAL)
     frontier = [root_directory]
 
     def log_progress():
         if throttle.due():
+            # Decoding (not scanning) is the slow part of the walk - see the
+            # root-fan-out stretch described above, where dirs_popped and
+            # entries both sit still for as long as WALK_LOG_INTERVAL while
+            # thousands of leaf directories get decoded. So the pct here
+            # tracks decoded_bytes against leaf_blob's total size rather
+            # than entries or dirs_popped. It's still only an upper-bound
+            # estimate. tile_id pruning means the walk can (and on a
+            # min/max-zoom-restricted run, will) finish without ever
+            # decoding every byte of leaf_blob, so the pct can stop short of
+            # 100% at completion.
+            pct = f" (~{100 * decoded_bytes / total_bytes:.1f}%)" if total_bytes else ""
             print(f"decoded {dirs_decoded} directories, {dirs_popped} processed, "
-                  f"{len(entries)} entries so far", file=sys.stderr)
+                  f"{len(entries)} entries so far{pct}", file=sys.stderr)
 
     while frontier:
         directory = frontier.pop()
@@ -192,6 +207,7 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
                     node_bytes = leaf_blob[entry.offset:entry.offset + entry.length]
                     frontier.append(deserialize_directory(node_bytes))
                     dirs_decoded += 1
+                    decoded_bytes += len(node_bytes)
                     log_progress()
             elif entry.tile_id + entry.run_length > tile_id_start:
                 entries.append(entry)
@@ -220,6 +236,7 @@ def collect_entries(session, url, min_zoom, max_zoom):
 
     tile_id_start = zxy_to_tileid(min_zoom, 0, 0) if min_zoom > 0 else 0
     tile_id_limit = zxy_to_tileid(max_zoom + 1, 0, 0)
+    print(f"starting decode ({header['tile_entries_count']} entries expected)", file=sys.stderr)
     entries = walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     entries.sort(key=lambda entry: entry.offset)
     return header, entries
