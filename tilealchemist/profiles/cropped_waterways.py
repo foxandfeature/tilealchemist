@@ -85,13 +85,12 @@ class CroppedWaterwaysProfile(Profile):
 
         return features, extent
 
-    def gap_tile_bytes(self, zoom, tile_column, tile_row):
-        """A gap tile means the source archive had nothing at all for this
-        tile_id (no water, no waterway), so there's no faithful "cropped
-        waterway" content to invent, unlike land's well-defined "whole
-        square minus nothing" case. True for every location, so
-        (zoom, tile_column, tile_row) go unused."""
-        return None
+    # No gap_tile_bytes() override: a gap tile means the source archive had
+    # nothing at all for this tile_id (no water, no waterway), so there's no
+    # faithful "cropped waterway" content to invent. `Profile`'s default
+    # gap_tile_bytes() already lands on this: transform_layer({}) sees no
+    # waterway layer and returns None, same as any real tile with no
+    # waterway features at all.
 
 
 PROFILE = CroppedWaterwaysProfile

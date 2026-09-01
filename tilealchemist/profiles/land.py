@@ -23,7 +23,6 @@ class LandProfile(Profile):
 
     def __init__(self, schema):
         self.schema = schema
-        self._gap_tile_cache = None
 
     def vector_layers_json(self):
         return [{"id": self.output_layer_name, "fields": {}}]
@@ -54,18 +53,6 @@ class LandProfile(Profile):
 
         features = self._land_features(land)
         return (features, extent) if features is not None else None
-
-    def gap_tile_bytes(self, zoom, tile_column, tile_row):
-        """Gap entries are tile_ids absent from the archive entirely, not
-        just missing a water layer, so every one is an identical bare
-        square regardless of location: (zoom, tile_column, tile_row) go
-        unused here, this profile has no location-dependent gap policy."""
-        if self._gap_tile_cache is None:
-            square = water.buffered_square(GAP_TILE_EXTENT, self.schema)
-            features = self._land_features(square)
-            self._gap_tile_cache = (
-                self._encode_tile(features, GAP_TILE_EXTENT) if features is not None else None)
-        return self._gap_tile_cache
 
 
 PROFILE = LandProfile

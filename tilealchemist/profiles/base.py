@@ -55,24 +55,25 @@ class Profile(ABC):
         not this method's contract. Whatever the transform actually does
         (invert, crop, filter, reclassify, ...) is up to the implementation."""
 
-    @abstractmethod
     def gap_tile_bytes(self, zoom, tile_column, tile_row):
         """Bytes to write for this (z, x, y) gap tile (a tile_id entirely
         absent from the source archive), or None to skip writing this one.
-        Called once per gap tile, with that tile's own coordinates, so a
-        profile is free to vary its answer by location or zoom (e.g. "no
-        gap content above z10") instead of being forced into one fixed
-        answer for the whole run. A profile whose content genuinely doesn't
-        vary (like `land`'s bare square) should still memoize internally
-        rather than recomputing per call, since this can be called a lot:
-        large empty stretches (deep desert, ice sheet interiors, ...) can
-        be hundreds of thousands of tiles in a single worker. Implementations
-        that need to produce MVT bytes should call `self._encode_tile(features,
-        extent)` rather than importing `tilealchemist.mvt` directly. Left
-        abstract rather than given a default (unlike `transform_tile_bytes()`)
-        because caching strategy here is profile-owned: whether/how to
-        memoize, and whether the answer varies by location, isn't something
-        this base class can presume."""
+        Default: a gap tile is just an ordinary tile with no source layers
+        at all, so this runs it through the same `transform_layer()` a real
+        tile would use, with `decoded_tile={}` standing in for "nothing
+        here" (every `TileSchema` accessor already treats a missing key as
+        "no data", e.g. `decoded_tile.get("water")`). The result is memoized
+        after the first call, since (zoom, tile_column, tile_row) go unused
+        here and this can be called a lot: large empty stretches (deep
+        desert, ice sheet interiors, ...) can be hundreds of thousands of
+        tiles in a single worker. Not sealed: a profile that needs a
+        different answer, or one that varies by location or zoom (e.g. "no
+        gap content above z10"), can override this directly instead and use
+        (zoom, tile_column, tile_row)."""
+        if not hasattr(self, "_gap_tile_cache"):
+            result = self.transform_layer({})
+            self._gap_tile_cache = self._encode_tile(*result) if result is not None else None
+        return self._gap_tile_cache
 
     def _encode_tile(self, features, extent):
         return mvt.encode_tile(self.output_layer_name, features, extent)
