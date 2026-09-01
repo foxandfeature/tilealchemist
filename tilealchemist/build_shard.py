@@ -75,7 +75,7 @@ class DownloadProgress:
     def __init__(self, total_bytes, interval):
         self.total_bytes = total_bytes
         self.downloaded = 0
-        self.throttle = UpdateLineThrottle(interval)
+        self.throttle = UpdateLineThrottle(interval, fire_immediately=True)
         self.lock = threading.Lock()
 
     def add(self, byte_count, tile):

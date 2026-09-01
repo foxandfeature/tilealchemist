@@ -72,7 +72,7 @@ class DownloadProgress:
     def __init__(self, total_bytes, interval):
         self.total_bytes = total_bytes
         self.downloaded = 0
-        self.throttle = UpdateLineThrottle(interval)
+        self.throttle = UpdateLineThrottle(interval, fire_immediately=True)
 
     def add(self, byte_count):
         self.downloaded += byte_count
@@ -159,7 +159,19 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     WALK_LOG_INTERVAL is set - dirs_decoded counts decodes for the same
     reason, so the printed number actually reflects work done instead of
     sitting at a misleadingly small "1 directory" for as long as the root's
-    fan-out takes to unpack."""
+    fan-out takes to unpack.
+
+    Why "entries so far" can sit at 0 for most of a run: entries only get
+    appended once a directory is *popped* and scanned, but on a large global
+    archive the root directory is itself typically nothing but run_length=0
+    pointers - no real tile entries live that shallow. Root's own for-loop
+    (the very first frontier.pop()) can, by itself, decode every one of the
+    thousands of leaf directories it points to before the while loop ever
+    gets back around to popping any of them - dirs_decoded already reflects
+    that work, but entries can't grow until popping (and therefore scanning)
+    starts. `queued` makes that visible instead of leaving "0 entries" to
+    look stalled: a shrinking `queued` alongside a still-climbing
+    dirs_decoded is root's fan-out finishing, not a wedged walk."""
     entries = []
     dirs_decoded = 1  # root_directory itself, already decoded by the caller
     throttle = UpdateLineThrottle(WALK_LOG_INTERVAL)
@@ -178,8 +190,8 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
                     frontier.append(deserialize_directory(node_bytes))
                     dirs_decoded += 1
                     if throttle.due():
-                        print(f"decoded {dirs_decoded} directories, {len(entries)} entries so far",
-                              file=sys.stderr)
+                        print(f"decoded {dirs_decoded} directories ({len(frontier)} queued), "
+                              f"{len(entries)} entries so far", file=sys.stderr)
             elif entry.tile_id + entry.run_length > tile_id_start:
                 entries.append(entry)
 
