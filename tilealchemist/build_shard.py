@@ -8,11 +8,14 @@ Logging to stderr is split into two kinds:
 - Major lines (source resolved, entries assigned, "starting download"/
   "starting transform", final written/skipped summary) always print
   unconditionally, one per phase transition, never more.
-- Update lines (`worker N: update: ...`) exist only so a step that's taking
-  a while doesn't look stuck: current download/transform progress, printed
-  at most once per `--report-interval` seconds (default 60), and not at all
-  if the step finishes before the first interval elapses. A fast worker's
-  whole log is major lines only.
+- Update lines (`update: ...`) exist only so a step that's taking a while
+  doesn't look stuck: current download progress, printed at most once per
+  DOWNLOAD_REPORT_INTERVAL seconds (shorter, since a stalled/slow transfer
+  is worth surfacing sooner than a slow transform - same reasoning as
+  tiledistillery's download vs. build intervals); current transform
+  progress, printed at most once per `--report-interval` seconds (default
+  60). Either way, not at all if the step finishes before its first
+  interval elapses. A fast worker's whole log is major lines only.
 
     tilealchemist-build-shard --worker-index 0 --profile tilealchemist/profiles/land.py \
         --manifest manifests/worker-000.bin --source manifests/source.json \
@@ -48,6 +51,17 @@ WORLD_BOUNDS = "-180,-85.051129,180,85.051129"
 # print, and the minimum time a step must run before its first update line
 # appears at all. Major phase-transition lines always print regardless.
 DEFAULT_REPORT_INTERVAL = 60.0
+
+# Download progress gets its own, shorter interval instead of sharing
+# --report-interval with the transform phase: a shard's whole-batch download
+# (one Range request, tens to low hundreds of MB) routinely finishes in well
+# under 60s on a healthy connection, so at DEFAULT_REPORT_INTERVAL it prints
+# zero update lines even though the transform phase right after it - with
+# many chunks each logging a major "chunk done" line as they complete - looks
+# much more alive by comparison. Not user-configurable (unlike
+# --report-interval): tiledistillery's claim.py draws the same distinction
+# with fixed constants (15s download / 60s build) for the same reason.
+DOWNLOAD_REPORT_INTERVAL = 15.0
 
 
 def make_session():
@@ -440,7 +454,9 @@ def parse_args():
     parser.add_argument("--schema", choices=sorted(SCHEMAS), default="openmaptiles",
                          help="which source tile schema to read (default openmaptiles)")
     parser.add_argument("--report-interval", type=float, default=DEFAULT_REPORT_INTERVAL,
-                         help="seconds between throttled progress updates (default 60)")
+                         help="seconds between throttled transform-progress updates (default 60; "
+                              "download-progress updates use their own fixed interval, see "
+                              "DOWNLOAD_REPORT_INTERVAL)")
     parser.add_argument("--transform-workers", type=int, default=os.cpu_count() or 1,
                          help="parallel processes for the CPU-bound transform phase "
                               "(default: all available cores; 1 disables pooling and runs "
@@ -498,7 +514,7 @@ def fetch_real_entries_blob(real_entries, args, source):
     print(f"fetching {len(real_entries)} entries in a single range request "
           f"({batch_length} bytes)", file=sys.stderr)
 
-    download_progress = DownloadProgress(batch_length, args.report_interval)
+    download_progress = DownloadProgress(batch_length, DOWNLOAD_REPORT_INTERVAL)
     print(f"starting download ({batch_length} bytes, {len(real_entries)} entries)",
           file=sys.stderr)
     blob = fetch_batch_streaming_with_retries(

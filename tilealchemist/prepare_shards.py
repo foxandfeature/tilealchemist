@@ -39,6 +39,12 @@ MAX_SUPPORTED_ZOOM = 30
 # from that in-memory buffer with zero further network requests.
 WALK_LOG_INTERVAL = 5.0
 
+# How often (seconds) the index-download update line is allowed to print.
+# The index fetch is one blocking Range request (see collect_entries()), so
+# unlike WALK_LOG_INTERVAL this is checked from inside the chunked read loop
+# itself - see DownloadProgress.
+DOWNLOAD_LOG_INTERVAL = 5.0
+
 # Retries handle two transient cold-cache-stampede responses: a 200 instead
 # of 206 (server ignored Range, the same check as build_shard.py's
 # fetch_batch_streaming_with_retries(), since reading that in full would be tens of GB),
@@ -56,6 +62,26 @@ def make_session():
     return session
 
 
+class DownloadProgress:
+    """Same shape as build_shard.py's DownloadProgress, minus the per-tile
+    position estimate: there's no tile mapping to report here, just one
+    contiguous Range fetch (the directory index) worth showing bytes/pct
+    for. No lock either - unlike build_shard.py's workers, prepare_shards.py
+    fetches one Range request at a time on a single thread."""
+
+    def __init__(self, total_bytes, interval):
+        self.total_bytes = total_bytes
+        self.downloaded = 0
+        self.throttle = UpdateLineThrottle(interval)
+
+    def add(self, byte_count):
+        self.downloaded += byte_count
+        if self.throttle.due():
+            pct = (100 * self.downloaded / self.total_bytes) if self.total_bytes else 100.0
+            print(f"update: downloading directory index: "
+                  f"{self.downloaded}/{self.total_bytes} bytes ({pct:.1f}%)", file=sys.stderr)
+
+
 def _wait_before_retry(attempt, response, range_header, reason=""):
     """Prints the retry directly as a `::warning::` workflow command (rather
     than a plain line now and a replayed `::warning::` later) so a run that
@@ -71,7 +97,7 @@ def _wait_before_retry(attempt, response, range_header, reason=""):
     time.sleep(delay)
 
 
-def _fetch_range_attempt(session, url, range_header, attempt):
+def _fetch_range_attempt(session, url, range_header, attempt, download_progress, chunk_size):
     """Returns the response body on success, or None if `_wait_before_retry`
     already handled the backoff and the caller should try again."""
     with session.get(url, headers={"Range": range_header}, timeout=60, stream=True) as response:
@@ -93,13 +119,20 @@ def _fetch_range_attempt(session, url, range_header, attempt):
             _wait_before_retry(attempt, response, range_header, reason=" instead of 206")
             return None
 
-        return response.content
+        chunks = []
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            if download_progress is not None:
+                download_progress.add(len(chunk))
+        return b"".join(chunks)
 
 
-def fetch_range(session, url, offset, length):
+def fetch_range(session, url, offset, length, download_progress=None, chunk_size=1024 * 1024):
     range_header = f"bytes={offset}-{offset + length - 1}"
     for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
-        result = _fetch_range_attempt(session, url, range_header, attempt)
+        result = _fetch_range_attempt(session, url, range_header, attempt, download_progress, chunk_size)
         if result is not None:
             return result
 
@@ -115,15 +148,25 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     sibling's tile_id (or tile_id_limit, past the last sibling) is an upper
     bound on it. That's enough to decide "entirely below tile_id_start" or
     "entirely at/above tile_id_limit" without ever decoding the subtree, so
-    min_zoom shrinks the walk itself instead of just filtering its result."""
+    min_zoom shrinks the walk itself instead of just filtering its result.
+
+    The progress check lives right next to deserialize_directory(), not once
+    per while-loop iteration: that decode call is where the actual CPU time
+    goes, and a single frontier.pop() can trigger thousands of them (e.g. a
+    densely-fanned-out root directory) before the while loop ever gets back
+    around to popping the next entry. Checking only per-pop would leave that
+    entire stretch unable to print a second update no matter how low
+    WALK_LOG_INTERVAL is set - dirs_decoded counts decodes for the same
+    reason, so the printed number actually reflects work done instead of
+    sitting at a misleadingly small "1 directory" for as long as the root's
+    fan-out takes to unpack."""
     entries = []
-    dirs_walked = 0
+    dirs_decoded = 1  # root_directory itself, already decoded by the caller
     throttle = UpdateLineThrottle(WALK_LOG_INTERVAL)
     frontier = [root_directory]
 
     while frontier:
         directory = frontier.pop()
-        dirs_walked += 1
         for index, entry in enumerate(directory):
             if entry.tile_id >= tile_id_limit:
                 break
@@ -133,12 +176,12 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
                 if next_tile_id > tile_id_start:
                     node_bytes = leaf_blob[entry.offset:entry.offset + entry.length]
                     frontier.append(deserialize_directory(node_bytes))
+                    dirs_decoded += 1
+                    if throttle.due():
+                        print(f"decoded {dirs_decoded} directories, {len(entries)} entries so far",
+                              file=sys.stderr)
             elif entry.tile_id + entry.run_length > tile_id_start:
                 entries.append(entry)
-
-        if throttle.due():
-            print(f"decoded {dirs_walked} directories, {len(entries)} entries so far "
-                  f"(local, no network - the index is already in memory)", file=sys.stderr)
 
     return entries
 
@@ -153,9 +196,11 @@ def collect_entries(session, url, min_zoom, max_zoom):
 
     index_start = header["root_offset"]
     index_end = header["leaf_directory_offset"] + header["leaf_directory_length"]
-    print(f"fetching directory index ({(index_end - index_start) / 1e6:.0f}MB: root "
-          f"directory + every leaf directory) as a single request", file=sys.stderr)
-    index_blob = fetch_range(session, url, index_start, index_end - index_start)
+    index_length = index_end - index_start
+    print(f"starting download ({index_length} bytes, {header['tile_entries_count']} entries)",
+          file=sys.stderr)
+    download_progress = DownloadProgress(index_length, DOWNLOAD_LOG_INTERVAL)
+    index_blob = fetch_range(session, url, index_start, index_length, download_progress)
 
     root_directory = deserialize_directory(index_blob[:header["root_length"]])
     leaf_blob = index_blob[header["leaf_directory_offset"] - index_start:]
