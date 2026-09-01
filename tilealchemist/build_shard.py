@@ -496,8 +496,8 @@ def load_source(path):
 def split_manifest_entries(entries):
     """Gap entries (see compute_gaps() in prepare_shards.py) are tagged
     with length=0, since there's nothing to fetch for them: the profile's
-    gap_tile_bytes() (see profiles/base.py) is called instead, once per
-    (zoom, tile_column, tile_row) in their run."""
+    gap_tile_bytes (see profiles/base.py) is written at every
+    (zoom, tile_column, tile_row) in their run instead."""
     real_entries = [entry for entry in entries if entry.length > 0]
     gap_entries = [entry for entry in entries if entry.length == 0]
     return real_entries, gap_entries
@@ -539,32 +539,28 @@ def write_output_tiles(results, connection):
 
 
 def write_gap_tiles(gap_entries, connection, profile):
-    """Calls profile.gap_tile_bytes() once per gap tile, with that tile's
-    own (zoom, tile_column, tile_row), and writes only the ones that come
-    back non-None. `rows()` is a generator so a worker holding a
+    """Writes profile.gap_tile_bytes (see profiles/base.py) at every gap
+    tile's coordinates, or nothing at all if the profile fills gaps with
+    None. `rows()` is a generator so a worker holding a
     hundred-thousand-tile gap (a whole desert or ice sheet interior) never
     materializes them all as one Python list before handing them to
     sqlite3, matching how real entries are streamed in write_output_tiles's
     caller."""
-    written = 0
-    skipped = 0
+    output_data = profile.gap_tile_bytes
+    total = sum(entry.run_length for entry in gap_entries)
 
     def rows():
-        nonlocal written, skipped
         for entry in gap_entries:
             for run_offset in range(entry.run_length):
                 zoom, tile_column, tile_row = tileid_to_zxy(entry.tile_id + run_offset)
-                output_data = profile.gap_tile_bytes(zoom, tile_column, tile_row)
-                if output_data is None:
-                    skipped += 1
-                    continue
-                written += 1
                 yield (zoom, tile_column, (2 ** zoom - 1) - tile_row, output_data)
 
-    connection.executemany(
-        "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-        rows(),
-    )
+    if output_data is not None:
+        connection.executemany(
+            "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+            rows(),
+        )
+    written, skipped = (total, 0) if output_data is not None else (0, total)
     print(f"gap tiles (no archive entry at all): "
           f"filled {written}, skipped {skipped}", file=sys.stderr)
     return written, skipped

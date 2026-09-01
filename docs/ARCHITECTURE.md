@@ -64,9 +64,8 @@ community-run server. Instead:
    only stores a tile if it has something to render, so large empty
    stretches like desert or ice sheet interiors are simply absent).
    `prepare_shards.py` finds and chunks these, tagged with a sentinel
-   `length=0` so `build_shard.py` calls
-   `Profile.gap_tile_bytes(zoom, tile_column, tile_row)` for each one
-   instead of fetching anything (see `write_gap_tiles()`).
+   `length=0` so `build_shard.py` writes `Profile.gap_tile_bytes` at each
+   one's coordinates instead of fetching anything (see `write_gap_tiles()`).
 
 Workers log download/transform progress to stderr, throttled to once every
 60s (`--report-interval`); phase start/end lines always print regardless.

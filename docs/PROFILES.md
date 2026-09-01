@@ -25,7 +25,8 @@ class Profile(ABC):
     def vector_layers_json(self): ...
     def transform_tile_bytes(self, data): ...
     def transform_layer(self, decoded_tile): ...
-    def gap_tile_bytes(self, zoom, tile_column, tile_row): ...
+    @cached_property
+    def gap_tile_bytes(self): ...
     def _encode_tile(self, features, extent): ...
 ```
 
@@ -54,26 +55,26 @@ distributing your own profile" below).
   via `_encode_tile()`. A profile only implements `transform_layer()` in the
   common case; `transform_tile_bytes()` stays overridable directly for a
   profile with unusual needs (non-MVT output, full control over encoding).
-- **`gap_tile_bytes(zoom, tile_column, tile_row)`** is called once per *gap*
-  tile: a `tile_id` entirely absent from the source archive (see
+- **`gap_tile_bytes`** is the bytes written at every *gap* tile: a `tile_id`
+  entirely absent from the source archive (see
   [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#fetching-directory-driven-not-one-request-per-tile)
-  "Fetching" step 5), so there's no source bytes to pass in. Returns bytes
-  to write, or `None` to skip. Getting the tile's own coordinates means a
-  profile *can* vary its answer by location or zoom; one whose content
-  doesn't vary should memoize internally rather than recomputing per call,
-  since this can be called hundreds of thousands of times per worker for a
-  single large gap (e.g. an ice sheet interior). Left abstract (unlike
-  `transform_tile_bytes()`) because that caching strategy is profile-owned;
-  an implementation that needs to produce bytes should call
-  `self._encode_tile(features, extent)` rather than the whole codec itself.
+  "Fetching" step 5), so there's no source bytes to pass in. `None` means
+  write nothing for gap tiles at all. A property, not a per-tile call: a gap
+  tile is just an ordinary tile with no source layers, so the concrete
+  default runs `transform_layer({})` — every `TileSchema` accessor already
+  treats a missing layer key as "no data" — and there's nothing left for a
+  `(z, x, y)` to vary. It's a `cached_property`, so the encode happens once
+  per profile instance rather than for each of the hundreds of thousands of
+  tiles a single large gap (e.g. an ice sheet interior) can cover. A profile
+  needing a different answer can still override it, as a plain attribute,
+  property, or `cached_property`.
 - **`_encode_tile(features, extent)`** wraps `mvt.encode_tile()` with this
   profile's own `output_layer_name` already filled in — the one place a
-  profile touches the MVT codec directly, for cases like `gap_tile_bytes()`
-  overrides that want to cache final encoded bytes rather than re-encoding
-  every call.
+  profile touches the MVT codec directly, for a `gap_tile_bytes` or
+  `transform_tile_bytes()` override that produces encoded bytes itself.
 
-`build_shard.py` (the generic worker script) only ever calls
-`vector_layers_json()`, `transform_tile_bytes()`, and `gap_tile_bytes()`,
+`build_shard.py` (the generic worker script) only ever uses
+`vector_layers_json()`, `transform_tile_bytes()`, and `gap_tile_bytes`,
 nothing profile-specific.
 
 ## Shared helpers a profile can use
@@ -229,7 +230,8 @@ class MyProfile(Profile):
 
     def vector_layers_json(self): ...
     def transform_layer(self, decoded_tile): ...
-    def gap_tile_bytes(self, zoom, tile_column, tile_row): ...
+    # gap_tile_bytes only if the inherited transform_layer({}) default
+    # (see "The Profile contract" above) isn't the answer you want
 
 PROFILE = MyProfile
 ```

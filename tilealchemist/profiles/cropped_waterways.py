@@ -85,10 +85,10 @@ class CroppedWaterwaysProfile(Profile):
 
         return features, extent
 
-    # No gap_tile_bytes() override: a gap tile means the source archive had
+    # No gap_tile_bytes override: a gap tile means the source archive had
     # nothing at all for this tile_id (no water, no waterway), so there's no
     # faithful "cropped waterway" content to invent. `Profile`'s default
-    # gap_tile_bytes() already lands on this: transform_layer({}) sees no
+    # gap_tile_bytes already lands on this: transform_layer({}) sees no
     # waterway layer and returns None, same as any real tile with no
     # waterway features at all.
 

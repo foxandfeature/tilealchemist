@@ -7,7 +7,7 @@ own mbtiles output rows are both gzipped MVT. Backs `Profile`'s default
 relies on without importing this module directly. Still not a hard
 requirement of the `Profile` contract: a profile that needs non-MVT output,
 or full control over encoding, can override `transform_tile_bytes()`/
-`gap_tile_bytes()` directly instead. Not scoped to any one profile's domain
+`gap_tile_bytes` directly instead. Not scoped to any one profile's domain
 logic the way `water.py` is: any future profile, water-related or not, ends
 up needing exactly this decode/encode pair.
 """
