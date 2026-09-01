@@ -3,14 +3,12 @@ name: Publish to Backblaze B2 (reusable, repo-internal)
 # Downloads a merged .pmtiles artifact from a _pipeline.yml run and mirrors
 # it to Backblaze B2, gated behind the b2-publish GitHub Environment.
 #
-# Unlike _pipeline.yml and _publish-release.yml, this workflow is NOT meant
-# to be called cross-repo: a reusable workflow's `environment:` resolves
-# against the repo owning the *workflow file* (this repo), not the
-# caller's, so any repository could reach our real B2 credentials just by
-# calling this public file directly. The job's `if:` guard below is the
-# actual technical control (blocks the job before it ever reaches the
-# environment gate); required-reviewer approval on `b2-publish` itself
-# (this repo's own Settings, not this file) is a second layer on top.
+# Unlike _pipeline.yml and _publish-release.yml, NOT callable cross-repo: a
+# reusable workflow's `environment:` resolves against the repo owning the
+# *workflow file*, not the caller's, so any repository calling this public
+# file directly would otherwise reach this repo's real B2 credentials. See
+# docs/ARCHITECTURE.md "Publishing" for that and the second layer on top of
+# it (required-reviewer approval, configured in this repo's own Settings).
 
 on:
   workflow_call:
@@ -22,10 +20,9 @@ on:
 
 jobs:
   publish-b2:
-    # Blocks any repository other than this one from ever reaching the
-    # `environment: b2-publish` line below, closing the credential-leak
-    # shape described above at the point the job would otherwise start,
-    # not after the fact.
+    # The actual technical control for the above: blocks every other
+    # repository before the job starts, so before the `environment:` line
+    # below is evaluated and before any secret is touched.
     if: github.repository == 'foxandfeature/tilealchemist'
     runs-on: ubuntu-latest
     environment: b2-publish

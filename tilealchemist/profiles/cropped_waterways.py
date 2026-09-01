@@ -5,7 +5,6 @@ plain background) needs waterway lines pre-cropped to the land side, or a
 river/stream stroke would visibly double up with the water polygon it
 already runs through. See docs/EXAMPLE_PROFILES.md for the full rationale.
 """
-import shapely
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, shape
 
 from tilealchemist import water
@@ -13,12 +12,18 @@ from tilealchemist.profiles.base import Profile
 
 
 def _line_components(geometry):
-    """geometry.difference(polygon) on a LineString that's merely tangent to
-    the polygon (touches at a single point without truly overlapping) can
-    return a GeometryCollection mixing LineString/MultiLineString with
-    degenerate Point pieces at the tangent point, which
-    mapbox_vector_tile.encode() doesn't handle the same way as a clean
-    line geometry. Keep only the line parts."""
+    """Keep only the line parts of a difference() result. Insurance against
+    the GEOS version, not something observed on today's: a line-against-
+    polygon difference can in principle return a GeometryCollection mixing
+    line pieces with degenerate Points where the line merely touches the
+    polygon, which older (pre-OverlayNG) GEOS did emit. GEOS 3.11 restricts
+    the result to the left operand's dimension instead and never does -
+    checked across ~14k real waterway geometries at z13 - but `shapely` is
+    deliberately unpinned in profiles/requirements.txt, so the version isn't
+    ours to assume. Worth the isinstance check because the failure isn't a
+    subtly different encoding: mapbox_vector_tile.encode() raises outright
+    ("Encoding geometry collections not supported"), taking down the whole
+    shard rather than one feature."""
     if isinstance(geometry, (LineString, MultiLineString)):
         return geometry
     if isinstance(geometry, GeometryCollection):
@@ -37,8 +42,6 @@ class CroppedWaterwaysProfile(Profile):
     output_layer_name = "cropped-waterways"
     mbtiles_name = "cropped-waterways"
     compatible_schemas = None  # only calls TileSchema's universal API
-                                # (surface_water/waterway_lines/waterway_fields/
-                                # default_buffer_pixels/tile_size_pixels)
 
     def __init__(self, schema):
         self.schema = schema
@@ -65,17 +68,14 @@ class CroppedWaterwaysProfile(Profile):
             # way land.py already relies on, removes those near-duplicate
             # points before the overlay ever runs instead of hoping the
             # overlay survives them.
-            union = shapely.set_precision(union, water.OUTPUT_GRID_SIZE, mode="valid_output")
+            union = water.snap_to_output_grid(union)
 
         features = []
         for feature in waterway.features:
             geometry = shape(feature["geometry"])
             if union is not None:
-                geometry = shapely.set_precision(
-                    geometry, water.OUTPUT_GRID_SIZE, mode="valid_output")
                 geometry = geometry.difference(union, grid_size=water.OUTPUT_GRID_SIZE)
             cropped = _line_components(geometry)
-            cropped = shapely.set_precision(cropped, water.OUTPUT_GRID_SIZE, mode="valid_output")
             if cropped.is_empty:
                 continue
             features.append({"geometry": cropped, "properties": feature["properties"]})

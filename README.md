@@ -3,7 +3,7 @@
 A pipeline for building global PMTiles layers from an existing
 OpenStreetMap-based PMTiles source, tile by tile, driven by pluggable
 **profiles**: a profile decides what each tile becomes. Fetching, sharding
-(64-way by default, configurable), merging, and publishing are the
+(128-way by default, configurable), merging, and publishing are the
 pipeline's job; a profile is just the per-tile transform plugged into it.
 Profiles don't even have to live in this repository, see
 [`docs/PROFILES.md`](docs/PROFILES.md).
@@ -108,7 +108,7 @@ are actually called.
 | `docs/EXAMPLE_PROFILES.md` | What the shipped `land`/`cropped-waterways` profiles compute. |
 | `docs/ARCHITECTURE.md` | Pipeline mechanics: `Source` resolution, fetching, sharding, publishing. |
 | `examples/` | One example MapLibre style per profile. |
-| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel (`worker_count`, default 64), merges into one `.pmtiles` artifact per profile. `profile`/`output_basename` take one value or a comma-separated list, sharing one `prepare-shards` walk and one fetch per worker across however many profiles are given. Never publishes. Safe to call cross-repo. |
+| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel (`worker_count`, default 128), merges into one `.pmtiles` artifact per profile. `profile`/`output_basename` take one value or a comma-separated list, sharing one `prepare-shards` walk and one fetch per worker across however many profiles are given. Never publishes. Safe to call cross-repo. |
 | `.github/workflows/_publish-release.yml` | Reusable: publishes a merged `.pmtiles` artifact as a GitHub Release. Safe to call cross-repo. |
 | `.github/workflows/_publish-b2.yml` | Reusable: mirrors a merged `.pmtiles` artifact to Backblaze B2. Repo-internal only, see `docs/ARCHITECTURE.md` "Publishing". |
 | `.github/workflows/build-land-and-waterways.yml` | Calls `_pipeline.yml` with both shipped profiles at once, sharing one fetch, then publishes each separately. |
@@ -121,7 +121,26 @@ are actually called.
 | `tilealchemist/mvt.py` | Gzip+MVT decode/encode helper any profile can use. |
 | `tilealchemist/water.py` | Geometry math for water-related profiles specifically. |
 | `tilealchemist/manifest.py` | Binary manifest format shared by `prepare_shards.py`/`build_shard.py`. |
+| `tilealchemist/ranged_fetch.py` | HTTP Range fetching against the source archive (session, retry/backoff, 206 enforcement, download progress), shared by `prepare_shards.py`/`build_shard.py`. |
 | `tilealchemist/backoff.py`, `tilealchemist/throttle.py`, `tilealchemist/throttle_progress.sh` | HTTP retry backoff, throttled progress logging. |
+
+## Related projects
+
+- **[TileDistillery](https://github.com/foxandfeature/tiledistillery)** — a
+  sibling pipeline solving the adjacent problem: it builds PMTiles layers
+  from raw [Geofabrik](https://download.geofabrik.de) OSM extracts with
+  [tilemaker](https://github.com/systemed/tilemaker), region by region,
+  rather than reshaping tiles from an existing PMTiles archive. The two are
+  architecturally independent — neither is input or output for the other —
+  and they differ where their inputs force them to: TileDistillery's
+  regions are named, recurring units, so it runs a dynamic claim queue
+  ordered by each region's timing history, whereas TileAlchemist's shards
+  are cut fresh on every run and carry no stable identity, so its workers
+  are a plain independent matrix with no queue or history at all (see
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Parallelism").
+- **[trashtracker-tiles](https://github.com/foxandfeature/trashtracker-tiles)**
+  — a consumer of TileDistillery, not of this project: a worldwide
+  waste-basket layer that supplies only a tilemaker config and Lua profile.
 
 ## Contributing
 

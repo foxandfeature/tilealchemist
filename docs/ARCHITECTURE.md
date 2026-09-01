@@ -32,12 +32,17 @@ community-run server. Instead:
    which `Profile` runs later. Both bounds prune the walk itself, not just
    its result: sibling entries in a directory are sorted and non-overlapping
    tile-ID ranges, so a child pointer whose whole range falls outside
-   `[min_zoom, max_zoom]` is never even fetched, the same way `max_zoom`
-   already skipped fetching subtrees entirely past it before `min_zoom`
-   existed (see `fetch_directory_node()`).
+   `[min_zoom, max_zoom]` is never even decoded, the same way `max_zoom`
+   already skipped subtrees entirely past it before `min_zoom` existed (see
+   `walk_directory_tree()`). The walk itself issues no requests at all: the
+   whole index (root directory + metadata + every leaf directory) is laid
+   out contiguously by PMTiles writers and its extent is known from the
+   127-byte header, so `collect_entries()` pulls it down in a single Range
+   request and walks it from memory — two requests for the entire run,
+   however deep the tree.
 2. It sorts entries by *offset* (not tile-ID) and splits them into
    `--worker-count` (the reusable pipeline's `worker_count` input, default
-   64) **contiguous** chunks, one per worker (`tilealchemist/manifest.py`).
+   128) **contiguous** chunks, one per worker (`tilealchemist/manifest.py`).
    Offset order tracks tile-ID order almost
    everywhere, but also catches what tile-ID order misses: an entry that
    dedupes against a *non-adjacent* tile with identical bytes (e.g. the
@@ -78,7 +83,7 @@ far from GitHub Actions' 6-hour per-job runtime limit, plus smaller,
 failure-isolated jobs and fewer, smaller range requests per worker. GitHub
 also queues more than ~20 concurrently *running* jobs on a public repo, so
 a higher `worker_count` doesn't add parallelism at any one moment, just
-keeps each job smaller: that's why the default is 64, not higher. Each
+keeps each job smaller: that's why the default is 128, not higher. Each
 worker writes its own small mbtiles shard; a final job merges all shards
 with `tile-join` into one `.pmtiles` file.
 
@@ -101,16 +106,22 @@ Independently of that, the transform phase itself (decode, transform,
 encode, sqlite insert - all CPU-bound, not network) can now fan out across a
 worker's own CPU cores via `--transform-workers` (default: all available
 cores; `1` disables pooling and matches the old single-process behavior
-exactly). `real_entries` is split into contiguous chunks sized by
-cumulative source-tile bytes (`entry.length`) rather than by entry count,
+exactly). `real_entries` is split into contiguous chunks sized by **entry count**,
 deliberately producing several times more chunks than there are processes
-(`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter: transform cost
-tracks tile content, not entry count - equal entry counts have finished
-tens of minutes apart in production - so byte-weighted chunks start out
-closer to equal cost, and having more chunks than processes turns
-`ProcessPoolExecutor`'s own call queue into a work queue, where a process
-that finishes early pulls the next pending chunk instead of idling while
-one unlucky core grinds through a dense coastline. Each task reloads its
+(`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter. Entry count is
+the right unit because decode is paid once per entry regardless of that
+entry's byte length or `run_length`; weighting by cumulative bytes or by
+output-tile count was tried in production and failed badly in opposite
+directions (see `prepare_shards.py`'s `partition_contiguous()`, which
+documents both failures in full and applies the same rule when splitting
+work across workers). But equal entry counts still don't mean equal cost -
+transform cost tracks tile content, and four near-identically-sized chunks
+have finished tens of minutes apart - which is why chunk count exceeds
+process count: that turns `ProcessPoolExecutor`'s own call queue into a
+work queue, where a process that finishes early pulls the next pending
+chunk instead of idling while one unlucky core grinds through a dense
+coastline. Balancing gets the chunks roughly even; over-chunking absorbs
+whatever imbalance is left. Each task reloads its
 profiles from their own `--profile` paths rather than receiving live
 instances (profiles loaded via
 `load_profile()`'s `importlib.util.spec_from_file_location()` aren't
@@ -119,6 +130,41 @@ pool worker can't reconstruct them there). `tests/test_low_zoom_regression.py`
 (run on every push/PR via `.github/workflows/test.yml`) checks both of these
 changes against real OpenFreeMap data at low zoom, confirming identical
 output to the old per-profile, single-process behavior.
+
+### Worker independence
+
+Every `build-shards` matrix cell is fully independent, by construction:
+
+- Its **only** inputs are its own `manifests/worker-NNN.bin` and the shared,
+  read-only `manifests/source.json`. No worker reads another worker's
+  manifest, output, or logs.
+- There is **no shared mutable state anywhere in the run**: no queue, no
+  claim file, no lock, no timing history, no state branch. Nothing a worker
+  does is visible to any other worker.
+- Its output is one `<basename>-shard-<N>.mbtiles` per profile, named by its
+  own index, uploaded under its own artifact name, so two cells can never
+  collide on a path.
+- Its work is fixed before it starts, by `prepare-shards`. A cell computes
+  the same result whenever it runs.
+
+So execution order is irrelevant, cells may run concurrently or serially in
+any interleaving, and a single failed cell can be re-run on its own without
+touching the others. `fail-fast: false` is set for exactly that reason: one
+cell failing is not evidence about any other, so the rest are allowed to
+finish.
+
+This is the one structural difference from
+[TileDistillery](https://github.com/foxandfeature/tiledistillery), which
+*does* run a claim queue with shared state on the caller's `state` branch.
+The reason is the input, not a difference of opinion: TileDistillery's units
+of work are Geofabrik regions — named, stable across runs, wildly uneven in
+size — so it pays for a queue to get timing history and longest-first
+ordering out of it. TileAlchemist slices its own shards out of the source
+archive on every run, so a shard has no identity that survives to the next
+run, nothing to accumulate history against, and no size skew left to
+schedule around: `partition_contiguous()` has already balanced the cells
+before any of them start. A queue here would add coordination, shared
+state, and a failure mode, and buy nothing.
 
 ## Publishing
 

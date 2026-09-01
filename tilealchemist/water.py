@@ -10,6 +10,7 @@ slightly differently, since a cropped waterway line and the land polygon
 it should butt up against would otherwise risk disagreeing by a sub-pixel
 amount and showing a visible seam once rendered together.
 """
+import shapely
 from shapely.geometry import box, shape
 from shapely.ops import unary_union
 
@@ -31,6 +32,34 @@ WATER_GAP_CLOSING_BUFFER = 0.5
 # encoded output, purely for robustness against a GEOS TopologyException
 # seen on real-world water geometry (unable to assign free hole to a shell).
 OUTPUT_GRID_SIZE = 1.0
+
+
+def snap_to_output_grid(geometry):
+    """`geometry` snapped onto OUTPUT_GRID_SIZE, topology-aware: unlike a
+    plain coordinate rounding, mode="valid_output" repairs the validity
+    errors that rounding itself introduces (pieces that only start crossing
+    once each is rounded on its own). Lives here so every profile snaps with
+    the same grid *and* the same mode, same rationale as union_polygons().
+
+    Only the spelling is shared, not where it's applied: which geometry needs
+    snapping, and at which point in a transform, differs per profile and is
+    deliberately each profile's own call (see their call sites).
+
+    In particular surface_water_union()'s result is deliberately NOT snapped
+    here, though it always sits off-grid: source MVT coordinates are integers
+    by spec, so a union of them lands on the grid too except where
+    non-parallel edges cross, but WATER_GAP_CLOSING_BUFFER then moves every
+    boundary half a cell off it. Snapping that back would be *safe* - it
+    can't reopen a closed gap, since the buffer has already merged the
+    polygons into one ring, and it moves coastlines by at most half a unit
+    (1/32 px) - it just isn't worth it: cropped_waterways.py needs it only
+    because the line-against-polygon overlay throws without it, whereas
+    land_polygon()'s polygon-against-polygon overlay is already robust with
+    grid_size= alone, so for land it is a measured ~1.5x on the difference()
+    step that buys nothing and rewrites most tiles' bytes for an invisible
+    change.
+    """
+    return shapely.set_precision(geometry, OUTPUT_GRID_SIZE, mode="valid_output")
 
 
 def union_polygons(polygons):

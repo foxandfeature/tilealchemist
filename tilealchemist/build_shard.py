@@ -34,22 +34,25 @@ import os
 import sqlite3
 import sys
 import threading
-import time
 
-import requests
 from pmtiles.tile import tileid_to_zxy
 
-from tilealchemist.backoff import backoff_delay
 from tilealchemist.manifest import read_manifest
 from tilealchemist.profiles import load_profile
+from tilealchemist.ranged_fetch import (
+    TILE_DATA_READ_TIMEOUT,
+    DownloadProgress,
+    fetch_range,
+    make_session,
+)
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.throttle import UpdateLineThrottle
 
 WORLD_BOUNDS = "-180,-85.051129,180,85.051129"
 
-# How often (seconds) update lines (download %, current tile) are allowed to
-# print, and the minimum time a step must run before its first update line
-# appears at all. Major phase-transition lines always print regardless.
+# How often (seconds) transform update lines are allowed to print, and the
+# minimum time the transform must run before its first update line appears
+# at all. Major phase-transition lines always print regardless.
 DEFAULT_REPORT_INTERVAL = 60.0
 
 # Download progress gets its own, shorter interval instead of sharing
@@ -64,33 +67,6 @@ DEFAULT_REPORT_INTERVAL = 60.0
 DOWNLOAD_REPORT_INTERVAL = 15.0
 
 
-def make_session():
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(max_retries=3)
-    session.mount("https://", adapter)
-    return session
-
-
-class DownloadProgress:
-    def __init__(self, total_bytes, interval):
-        self.total_bytes = total_bytes
-        self.downloaded = 0
-        self.throttle = UpdateLineThrottle(interval, fire_immediately=True)
-        self.lock = threading.Lock()
-
-    def add(self, byte_count, tile):
-        with self.lock:
-            self.downloaded += byte_count
-            downloaded = self.downloaded
-        if self.throttle.due():
-            pct = (100 * downloaded / self.total_bytes) if self.total_bytes else 100.0
-            zoom, tile_column, tile_row = tile
-            print(f"update: downloading tile data: "
-                  f"{downloaded}/{self.total_bytes} bytes ({pct:.1f}%), "
-                  f"around tile z{zoom}/x{tile_column}/y{tile_row}",
-                  file=sys.stderr)
-
-
 class TransformProgress:
     def __init__(self, total_entries, interval):
         self.total_entries = total_entries
@@ -102,13 +78,27 @@ class TransformProgress:
         with self.lock:
             self.processed += 1
             processed = self.processed
-        if self.throttle.due():
-            pct = (100 * processed / self.total_entries) if self.total_entries else 100.0
-            zoom, tile_column, tile_row = tile
-            print(f"update: transforming tiles: "
-                  f"{processed}/{self.total_entries} ({pct:.1f}%), "
-                  f"currently around tile z{zoom}/x{tile_column}/y{tile_row}",
-                  file=sys.stderr)
+        if not self.throttle.due():
+            return
+        percent_complete = (100 * processed / self.total_entries) if self.total_entries else 100.0
+        zoom, tile_column, tile_row = tile
+        print(f"update: transforming tiles: "
+              f"{processed}/{self.total_entries} ({percent_complete:.1f}%), "
+              f"currently around tile z{zoom}/x{tile_column}/y{tile_row}",
+              file=sys.stderr)
+
+
+class ProfileTileCounts:
+    """One profile's running written/skipped totals, accumulated across the
+    real-entry and gap-entry phases."""
+
+    def __init__(self):
+        self.written = 0
+        self.skipped = 0
+
+    def add(self, written, skipped):
+        self.written += written
+        self.skipped += skipped
 
 
 def estimate_tile_at_offset(batch_entries_by_offset, offsets, position):
@@ -116,100 +106,6 @@ def estimate_tile_at_offset(batch_entries_by_offset, offsets, position):
     index = bisect.bisect_right(offsets, position) - 1
     index = max(0, min(index, len(batch_entries_by_offset) - 1))
     return tileid_to_zxy(batch_entries_by_offset[index].tile_id)
-
-
-# Retries for transient, non-fatal failure modes talking to the CDN, mostly
-# seen under many concurrent workers hitting a freshly-published archive at
-# once (cold-cache stampede): a full 200 instead of a 206 (server ignored
-# the Range header), a 429/5xx (server rate-limiting or buckling under the
-# burst), or the connection dropping mid-stream on a batch large enough to
-# take a while to download. None of these is a permanent per-request
-# failure, so all are worth a few backed-off retries before giving up for
-# good.
-MAX_RANGE_ATTEMPTS = 6
-RANGE_RETRY_BASE_DELAY = 2.0
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-
-
-def _wait_before_retry(worker_index, attempt, response, reason=""):
-    """Prints the retry directly as a `::warning::` workflow command (rather
-    than a plain line now and a replayed `::warning::` later) so a run that
-    hit the OpenFreeMap CDN's cold-cache stampede shows up as an actual
-    warning status in the Actions UI as it happens, with no duplicate line."""
-    delay = backoff_delay(attempt, response, RANGE_RETRY_BASE_DELAY)
-    print(f"::warning title=worker {worker_index} retry::got {response.status_code}{reason} "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    response.close()
-    time.sleep(delay)
-
-
-def _wait_before_retry_after_stream_error(worker_index, attempt, error, downloaded):
-    # No response to read a Retry-After header from (the connection already
-    # broke), so back off using jitter alone.
-    delay = backoff_delay(attempt, None, RANGE_RETRY_BASE_DELAY)
-    print(f"::warning title=worker {worker_index} retry::connection dropped after "
-          f"{downloaded} bytes ({error.__class__.__name__}) "
-          f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s", file=sys.stderr)
-    time.sleep(delay)
-
-
-def _fetch_batch_streaming_attempt(session, url, range_header, batch_offset, batch_entries, offsets,
-                                    download_progress, attempt, worker_index, chunk_size):
-    """Returns the downloaded bytes on success, or None if `_wait_before_retry`
-    already handled the backoff and the caller should try again."""
-    with session.get(url, headers={"Range": range_header}, timeout=300, stream=True) as response:
-        if response.status_code in RETRYABLE_STATUS_CODES:
-            if attempt == MAX_RANGE_ATTEMPTS:
-                response.raise_for_status()
-            _wait_before_retry(worker_index, attempt, response)
-            return None
-
-        response.raise_for_status()
-        if response.status_code != 206:
-            if attempt == MAX_RANGE_ATTEMPTS:
-                raise RuntimeError(
-                    f"expected HTTP 206 Partial Content for ranged request ({range_header}) "
-                    f"after {MAX_RANGE_ATTEMPTS} attempts, got {response.status_code}: server "
-                    f"ignored the Range header and would send the entire archive instead of "
-                    f"just this batch"
-                )
-            _wait_before_retry(worker_index, attempt, response, reason=" instead of 206")
-            return None
-
-        chunks = []
-        downloaded = 0
-        try:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-                downloaded += len(chunk)
-                tile = estimate_tile_at_offset(batch_entries, offsets, batch_offset + downloaded)
-                download_progress.add(len(chunk), tile)
-            return b"".join(chunks)
-        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as error:
-            # The CDN connection can drop mid-stream on a batch this large
-            # (seen as an IncompleteRead well past the halfway point); worth
-            # a few backed-off retries before giving up, same as a bad status.
-            if attempt == MAX_RANGE_ATTEMPTS:
-                raise
-            _wait_before_retry_after_stream_error(worker_index, attempt, error, downloaded)
-            return None
-
-
-def fetch_batch_streaming_with_retries(session, url, tile_data_offset, batch, download_progress,
-                                        worker_index, chunk_size=1024 * 1024):
-    batch_offset, batch_length, batch_entries = batch
-    abs_offset = tile_data_offset + batch_offset
-    offsets = [entry.offset for entry in batch_entries]
-    range_header = f"bytes={abs_offset}-{abs_offset + batch_length - 1}"
-
-    for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
-        result = _fetch_batch_streaming_attempt(
-            session, url, range_header, batch_offset, batch_entries, offsets,
-            download_progress, attempt, worker_index, chunk_size)
-        if result is not None:
-            return result
 
 
 def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles):
@@ -263,14 +159,14 @@ class _NullProgress:
 
 
 # How many transform chunks to create per worker process. One chunk per
-# process (today's behavior) leaves no room to rebalance: real runs showed
-# four chunks with near-identical entry counts (269648/269648/269648/269645)
-# finishing 2m17s, then +9m15s, then +17m9s apart, because CPU cost per tile
-# tracks tile content (dense coastline vs. open ocean), not entry count.
-# Submitting several smaller chunks per process lets ProcessPoolExecutor's
-# own call queue hand the next pending chunk to whichever process frees up
-# first, bounding the idle tail to roughly one chunk. 8 is high enough that
-# the tail is ~1/8 of a process's share, low enough that per-chunk overhead
+# process leaves no room to rebalance: real runs showed four chunks with
+# near-identical entry counts (269648/269648/269648/269645) finishing 2m17s,
+# then +9m15s, then +17m9s apart, because CPU cost per tile tracks tile
+# content (dense coastline vs. open ocean), not entry count. Submitting
+# several smaller chunks per process lets ProcessPoolExecutor's own call
+# queue hand the next pending chunk to whichever process frees up first,
+# bounding the idle tail to roughly one chunk. 8 is high enough that the
+# tail is ~1/8 of a process's share, low enough that per-chunk overhead
 # (one profile reimport, one blob-slice pickle) stays noise against
 # multi-minute chunks.
 TRANSFORM_CHUNKS_PER_WORKER = 8
@@ -279,20 +175,14 @@ TRANSFORM_CHUNKS_PER_WORKER = 8
 def _chunk_entries(real_entries, transform_workers):
     """Split real_entries into contiguous, ordered chunks of about
     len(real_entries)/(transform_workers*TRANSFORM_CHUNKS_PER_WORKER)
-    *entries* each - not cumulative entry.length (compressed source bytes)
-    and not cumulative entry.run_length (output tile count) either: decode
-    is paid once per entry regardless of its byte length or its
-    run_length, so entry count is what actually tracks how many of those
-    decode calls a chunk gets stuck with. Two earlier attempts got this
-    wrong in opposite directions. Balancing on bytes let one real chunk
-    end up with barely 1,000 entries while a same-sized-in-bytes neighbor
-    held over 170,000. Balancing on run_length made it worse: a handful of
-    entries with a huge run_length "fills" a tile-sized target almost
-    immediately while costing almost no decode work, so real,
-    unique-content entries (run_length 1, one decode each) piled up
-    into far larger chunks than their peers. Targets
-    TRANSFORM_CHUNKS_PER_WORKER chunks per worker process so free
-    processes can pull more work instead of idling (see run_transform()).
+    *entries* each - balanced on entry count rather than on cumulative
+    bytes or cumulative run_length, for exactly the reasons
+    prepare_shards.py's `partition_contiguous()` documents in full: decode
+    is paid once per entry regardless of its byte length or run_length, and
+    both other units were tried in production and failed in opposite
+    directions. Targets TRANSFORM_CHUNKS_PER_WORKER chunks per worker
+    process so free processes can pull more work instead of idling (see
+    run_transform()).
 
     Contiguity and original order are load-bearing: _blob_slice_for_chunk()
     slices one byte range per chunk, and transform_batch_blob_multi()'s
@@ -352,17 +242,17 @@ def _transform_chunk(profile_paths, schema_name, min_zoom, max_zoom, blob_slice,
 
 
 def run_transform(blob, batch, min_zoom, max_zoom, profiles, connections, args):
-    """Runs the transform phase either inline (today's behavior, and always
-    used for a single chunk, including --transform-workers 1) or fanned out
-    across a fixed-size process pool. Chunk count is deliberately larger
-    than the process count: ProcessPoolExecutor's internal call queue is
-    itself the work queue - its manager thread keeps only a couple of
-    submitted calls in flight per process and hands each remaining chunk to
-    whichever worker returns first, so a chunk that turns out expensive
-    delays only itself rather than stranding cores that already finished.
-    The CPU-bound part (decode, transform, encode) is what benefits from
-    more cores; the network fetch that produced `blob` already happened
-    once, sequentially, before this is called.
+    """Runs the transform phase either inline (always used for a single
+    chunk, including --transform-workers 1) or fanned out across a
+    fixed-size process pool. Chunk count is deliberately larger than the
+    process count: ProcessPoolExecutor's internal call queue is itself the
+    work queue - its manager thread keeps only a couple of submitted calls
+    in flight per process and hands each remaining chunk to whichever worker
+    returns first, so a chunk that turns out expensive delays only itself
+    rather than stranding cores that already finished. The CPU-bound part
+    (decode, transform, encode) is what benefits from more cores; the
+    network fetch that produced `blob` already happened once, sequentially,
+    before this is called.
 
     Each chunk's results are written to `connections` (one per profile,
     matched by position) as soon as that chunk is ready, instead of being
@@ -382,10 +272,10 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, connections, args):
     skipped = [0] * len(profiles)
 
     def record(chunk_results):
-        for i, (profile_results, connection) in enumerate(zip(chunk_results, connections)):
+        for index, (profile_results, connection) in enumerate(zip(chunk_results, connections)):
             chunk_written, chunk_skipped = write_output_tiles(profile_results, connection)
-            written[i] += chunk_written
-            skipped[i] += chunk_skipped
+            written[index] += chunk_written
+            skipped[index] += chunk_skipped
 
     if len(chunks) <= 1:
         print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries)",
@@ -397,17 +287,17 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, connections, args):
     print(f"starting transform for profiles {profile_names} ({len(real_entries)} entries, "
           f"{len(chunks)} chunks across up to {args.transform_workers} processes)", file=sys.stderr)
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.transform_workers) as executor:
-        futures = {}
+        pending = {}
         for index, chunk in enumerate(chunks):
             blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
             future = executor.submit(
                 _transform_chunk, args.profile, args.schema, min_zoom, max_zoom,
                 blob_slice, blob_slice_offset, chunk)
-            futures[future] = (index, len(chunk), len(blob_slice))
-        for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-            index, entry_count, byte_count = futures[future]
+            pending[future] = (index, len(chunk), len(blob_slice))
+        for completed_count, future in enumerate(concurrent.futures.as_completed(pending), start=1):
+            index, entry_count, byte_count = pending[future]
             record(future.result())
-            print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
+            print(f"chunk {index + 1} done ({completed_count}/{len(chunks)} chunks, "
                   f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)
     return written, skipped
 
@@ -489,8 +379,8 @@ def parse_args():
 
 
 def load_source(path):
-    with open(path) as file:
-        return json.load(file)
+    with open(path) as source_file:
+        return json.load(source_file)
 
 
 def split_manifest_entries(entries):
@@ -503,23 +393,30 @@ def split_manifest_entries(entries):
     return real_entries, gap_entries
 
 
-def fetch_real_entries_blob(real_entries, args, source):
+def fetch_real_entries_blob(real_entries, worker_index, source):
     """Single shared network fetch for this worker's real entries, reused by
-    every profile in args.profile: the raw bytes don't depend on which
-    profile(s) transform them afterward."""
-    session = make_session()
+    every profile in the run: the raw bytes don't depend on which profile(s)
+    transform them afterward. One range GET spanning the first entry's
+    offset to the last entry's end, which is contiguous because the manifest
+    is already a contiguous slice of offset order."""
     batch_offset = real_entries[0].offset
     batch_length = max(entry.offset + entry.length for entry in real_entries) - batch_offset
     batch = (batch_offset, batch_length, real_entries)
-    print(f"fetching {len(real_entries)} entries in a single range request "
-          f"({batch_length} bytes)", file=sys.stderr)
+    entry_offsets = [entry.offset for entry in real_entries]
 
-    download_progress = DownloadProgress(batch_length, DOWNLOAD_REPORT_INTERVAL)
-    print(f"starting download ({batch_length} bytes, {len(real_entries)} entries)",
-          file=sys.stderr)
-    blob = fetch_batch_streaming_with_retries(
-        session, source["url"], source["tile_data_offset"], batch, download_progress,
-        args.worker_index)
+    progress = DownloadProgress(batch_length, DOWNLOAD_REPORT_INTERVAL, "tile data")
+
+    def report_chunk(chunk_length, downloaded):
+        progress.add(chunk_length,
+                     estimate_tile_at_offset(real_entries, entry_offsets,
+                                             batch_offset + downloaded))
+
+    print(f"starting download ({batch_length} bytes, {len(real_entries)} entries "
+          f"in a single range request)", file=sys.stderr)
+    blob = fetch_range(
+        make_session(), source["url"], source["tile_data_offset"] + batch_offset, batch_length,
+        retry_label=f"worker {worker_index}", timeout=TILE_DATA_READ_TIMEOUT,
+        on_chunk=report_chunk)
     return blob, batch
 
 
@@ -566,13 +463,18 @@ def write_gap_tiles(gap_entries, connection, profile):
     return written, skipped
 
 
+def close_connections(connections):
+    for connection in connections:
+        connection.commit()
+        connection.close()
+
+
 def main():
-    # Setup: CLI args, source archive info, this worker's assigned entries.
     args = parse_args()
     source = load_source(args.source)
     profiles = [profile_class(SCHEMAS[args.schema]) for profile_class in args.profile_classes]
     print(f"source={source['url']} (build {source['build']}), "
-          f"profiles={', '.join(p.name for p in profiles)}", file=sys.stderr)
+          f"profiles={', '.join(profile.name for profile in profiles)}", file=sys.stderr)
 
     entries = read_manifest(args.manifest)
     real_entries, gap_entries = split_manifest_entries(entries)
@@ -584,40 +486,31 @@ def main():
 
     # Empty shard: nothing assigned to this worker at all.
     if not real_entries and not gap_entries:
-        for connection in connections:
-            connection.commit()
-            connection.close()
+        close_connections(connections)
         print(f"done: (empty shard) -> {', '.join(args.out)}", file=sys.stderr)
         return
 
-    written = [0] * len(profiles)
-    skipped = [0] * len(profiles)
+    counts = [ProfileTileCounts() for _ in profiles]
 
     # Real entries: fetch once, then transform every profile together
     # against the same fetched bytes (see run_transform()/transform_batch_blob_multi()).
     if real_entries:
-        blob, batch = fetch_real_entries_blob(real_entries, args, source)
+        blob, batch = fetch_real_entries_blob(real_entries, args.worker_index, source)
         real_written, real_skipped = run_transform(
             blob, batch, source["min_zoom"], source["max_zoom"], profiles, connections, args)
-        for i in range(len(profiles)):
-            written[i] += real_written[i]
-            skipped[i] += real_skipped[i]
+        for profile_counts, written, skipped in zip(counts, real_written, real_skipped):
+            profile_counts.add(written, skipped)
 
     # Gap entries: no fetch needed, just write whatever each profile fills gaps with.
     if gap_entries:
-        for i, (profile, connection) in enumerate(zip(profiles, connections)):
-            written_count, skipped_count = write_gap_tiles(gap_entries, connection, profile)
-            written[i] += written_count
-            skipped[i] += skipped_count
+        for profile_counts, profile, connection in zip(counts, profiles, connections):
+            profile_counts.add(*write_gap_tiles(gap_entries, connection, profile))
 
-    # Finalize: persist every shard and report results, one line per profile.
-    for connection in connections:
-        connection.commit()
-        connection.close()
+    close_connections(connections)
 
-    for profile, out, written_count, skipped_count in zip(profiles, args.out, written, skipped):
-        print(f"done: profile={profile.name} written={written_count} skipped={skipped_count} "
-              f"-> {out}", file=sys.stderr)
+    for profile, out, profile_counts in zip(profiles, args.out, counts):
+        print(f"done: profile={profile.name} written={profile_counts.written} "
+              f"skipped={profile_counts.skipped} -> {out}", file=sys.stderr)
 
 
 if __name__ == "__main__":

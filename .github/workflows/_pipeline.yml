@@ -2,25 +2,21 @@ name: TileAlchemist pipeline (reusable)
 
 # Builds one or more profiles' world-covering PMTiles layers: prepare-shards
 # walks the source archive once, build-shards runs every profile's per-tile
-# transform against the SAME fetched bytes across `worker_count` parallel
-# workers (one HTTP range GET per worker regardless of how many profiles
-# are being built), merge joins each profile's own shards into its own
-# .pmtiles file. Deliberately does NOT publish anywhere (no GitHub Release,
-# no B2 upload): that's the calling workflow's job, so its
-# `environment:`/secrets resolve against the caller's own repository, not
-# this one (see docs/ARCHITECTURE.md "Publishing"). Callers:
+# transform against the same fetched bytes across `worker_count` parallel
+# workers, merge joins each profile's own shards into its own .pmtiles file.
+# `profile`/`output_basename` each take one value or a comma-separated list
+# matched 1:1; each profile's result is uploaded as its own
+# `<output_basename>-pmtiles` artifact, which callers reference by name.
+#
+# Deliberately does NOT publish anywhere (no GitHub Release, no B2 upload):
+# that's the calling workflow's job, so its `environment:`/secrets resolve
+# against the caller's own repository, not this one. Callers:
 # build-land-and-waterways.yml, or a third-party repo's own workflow via
 # `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
 #
-# `profile`/`output_basename` each take one value (e.g.
-# "tilealchemist/profiles/land.py") or a comma-separated list matched 1:1
-# (e.g. "tilealchemist/profiles/land.py,tilealchemist/profiles/cropped_waterways.py"
-# / "land,cropped-waterways"); a single value is simply a list of one,
-# handled the same way. Each profile's merged .pmtiles is uploaded as a
-# `<output_basename>-pmtiles` artifact (see the `merge` job below); callers
-# reference that name directly rather than through a job output, since
-# GitHub Actions doesn't guarantee consistent job outputs across multiple
-# matrix cells.
+# See docs/ARCHITECTURE.md "Fetching"/"Parallelism"/"Publishing" for why the
+# fetch happens once per worker regardless of profile count, and why callers
+# go through the artifact name rather than a job output.
 
 on:
   workflow_call:
@@ -73,10 +69,10 @@ jobs:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
         run: |
-          IFS=',' read -ra P <<< "$PROFILE"
-          IFS=',' read -ra B <<< "$OUTPUT_BASENAME"
-          if [ "${#P[@]}" -ne "${#B[@]}" ]; then
-            echo "::error::profile has ${#P[@]} entries but output_basename has ${#B[@]}; must match 1:1"
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          IFS=',' read -ra BASENAME_ENTRIES <<< "$OUTPUT_BASENAME"
+          if [ "${#PROFILE_ENTRIES[@]}" -ne "${#BASENAME_ENTRIES[@]}" ]; then
+            echo "::error::profile has ${#PROFILE_ENTRIES[@]} entries but output_basename has ${#BASENAME_ENTRIES[@]}; must match 1:1"
             exit 1
           fi
 
@@ -154,9 +150,9 @@ jobs:
         run: |
           pip install .
 
-          IFS=',' read -ra PROFILES <<< "$PROFILE"
-          for P in "${PROFILES[@]}"; do
-            REQUIREMENTS="$(dirname "$P")/requirements.txt"
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
+            REQUIREMENTS="$(dirname "$PROFILE_PATH")/requirements.txt"
             if [ -f "$REQUIREMENTS" ]; then
               pip install -r "$REQUIREMENTS"
             fi
@@ -167,7 +163,7 @@ jobs:
           name: shard-manifests
           path: manifests
 
-      - name: "Build this worker's tile shard(s): one fetch, every profile"
+      - name: "Build this worker's tile shard(s)"
         env:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}

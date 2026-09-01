@@ -99,7 +99,7 @@ jobs:
             "${TITLE}, min_zoom=${MIN_ZOOM}, max_zoom=${MAX_ZOOM}." \
             "Built $(date -u +%Y-%m-%d) (run #${{ github.run_number }})." \
             "" \
-            "Download (requires the [GitHub CLI](https://cli.github.com/), \`gh\`):" \
+            "Download (requires the [GitHub CLI](https://cli.github.com/)):" \
             "" \
             '**macOS / Linux:**' \
             '```' \

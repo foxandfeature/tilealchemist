@@ -3,8 +3,6 @@ a buffered tile square after subtracting them. See docs/EXAMPLE_PROFILES.md
 ("land") for the full rationale, including why the square is buffered
 past the tile edge and why the water union gets a snap-rounding difference.
 """
-import shapely
-
 from tilealchemist import water
 from tilealchemist.profiles.base import Profile
 
@@ -36,7 +34,7 @@ class LandProfile(Profile):
         # repair can't fix that class of error and silently drops the whole
         # feature, so snap to the same grid ourselves first with a
         # topology-aware snap that repairs validity as it rounds.
-        land = shapely.set_precision(land, water.OUTPUT_GRID_SIZE, mode="valid_output")
+        land = water.snap_to_output_grid(land)
 
         if land.is_empty:
             return None
