@@ -150,35 +150,38 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
     "entirely at/above tile_id_limit" without ever decoding the subtree, so
     min_zoom shrinks the walk itself instead of just filtering its result.
 
-    The progress check lives right next to deserialize_directory(), not once
-    per while-loop iteration: that decode call is where the actual CPU time
-    goes, and a single frontier.pop() can trigger thousands of them (e.g. a
-    densely-fanned-out root directory) before the while loop ever gets back
-    around to popping the next entry. Checking only per-pop would leave that
-    entire stretch unable to print a second update no matter how low
-    WALK_LOG_INTERVAL is set - dirs_decoded counts decodes for the same
-    reason, so the printed number actually reflects work done instead of
-    sitting at a misleadingly small "1 directory" for as long as the root's
-    fan-out takes to unpack.
-
-    Why "entries so far" can sit at 0 for most of a run: entries only get
-    appended once a directory is *popped* and scanned, but on a large global
-    archive the root directory is itself typically nothing but run_length=0
-    pointers - no real tile entries live that shallow. Root's own for-loop
-    (the very first frontier.pop()) can, by itself, decode every one of the
-    thousands of leaf directories it points to before the while loop ever
-    gets back around to popping any of them - dirs_decoded already reflects
-    that work, but entries can't grow until popping (and therefore scanning)
-    starts. `queued` makes that visible instead of leaving "0 entries" to
-    look stalled: a shrinking `queued` alongside a still-climbing
-    dirs_decoded is root's fan-out finishing, not a wedged walk."""
+    The walk has two phases with very different rhythms, and the progress
+    check has to catch both: unpacking (deserialize_directory(), triggered
+    by run_length=0 pointer entries) and scanning (frontier.pop(), where
+    real entries actually get appended). On a large global archive the root
+    directory is itself typically nothing but pointers - no real tile
+    entries live that shallow - so root's own for-loop (the very first pop)
+    can by itself decode every one of the thousands of leaf directories it
+    points to, all before the while loop ever gets back around to popping
+    any of them: entries stays at 0 for that whole stretch no matter what,
+    since popping is what scans for entries. Checking due() only inside the
+    decode branch would leave that unpacking stretch dark for as long as
+    WALK_LOG_INTERVAL, however low it's set, if the check were only per-pop
+    (dozens of decodes can happen between two pops); checking it only per-pop
+    would symmetrically leave the *later* scanning stretch dark, since
+    popping a pure-leaf directory triggers no further decodes at all. Hence
+    both checks below, sharing one throttle: whichever phase is currently
+    running is the one that keeps tripping it."""
     entries = []
     dirs_decoded = 1  # root_directory itself, already decoded by the caller
+    dirs_popped = 0
     throttle = UpdateLineThrottle(WALK_LOG_INTERVAL)
     frontier = [root_directory]
 
+    def log_progress():
+        if throttle.due():
+            print(f"decoded {dirs_decoded} directories, {dirs_popped} processed, "
+                  f"{len(entries)} entries so far", file=sys.stderr)
+
     while frontier:
         directory = frontier.pop()
+        dirs_popped += 1
+        log_progress()
         for index, entry in enumerate(directory):
             if entry.tile_id >= tile_id_limit:
                 break
@@ -189,9 +192,7 @@ def walk_directory_tree(root_directory, leaf_blob, tile_id_start, tile_id_limit)
                     node_bytes = leaf_blob[entry.offset:entry.offset + entry.length]
                     frontier.append(deserialize_directory(node_bytes))
                     dirs_decoded += 1
-                    if throttle.due():
-                        print(f"decoded {dirs_decoded} directories ({len(frontier)} queued), "
-                              f"{len(entries)} entries so far", file=sys.stderr)
+                    log_progress()
             elif entry.tile_id + entry.run_length > tile_id_start:
                 entries.append(entry)
 
