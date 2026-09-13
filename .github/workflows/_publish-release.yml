@@ -1,0 +1,110 @@
+name: Publish a GitHub Release (reusable)
+
+# Downloads a merged .pmtiles artifact from a _pipeline.yml run, splits it
+# into release-sized parts if needed, and publishes/replaces a fixed-tag
+# GitHub Release. Called once per layer by a caller repository's own build
+# workflow.
+#
+# Safe to share cross-repo, unlike a job carrying credentials of its own:
+# the release lands in the caller's repo, under the caller's own token. See
+# docs/ARCHITECTURE.md "Releasing" for the tag and split mechanics below,
+# and "Why publishing stops there" for where the line is drawn.
+
+on:
+  workflow_call:
+    inputs:
+      output_basename:
+        description: 'Base filename inside the "<output_basename>-pmtiles" artifact uploaded by a _pipeline.yml run, e.g. "land" for land.pmtiles.'
+        required: true
+        type: string
+      tag:
+        description: 'Fixed release tag, replaced on every run, e.g. "land-latest".'
+        required: true
+        type: string
+      title:
+        description: 'Release title, e.g. "Global land layer".'
+        required: true
+        type: string
+      min_zoom:
+        description: "Included in the release notes text."
+        required: false
+        type: string
+        default: "0"
+      max_zoom:
+        description: "Included in the release notes text."
+        required: true
+        type: string
+
+jobs:
+  publish-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the merged layer
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-pmtiles
+
+      - name: Split into release-sized parts if needed
+        id: split
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          FILE="${OUTPUT_BASENAME}.pmtiles"
+          LIMIT_BYTES=$((1900 * 1024 * 1024))
+          SIZE_BYTES=$(stat -c%s "$FILE")
+          if [ "$SIZE_BYTES" -gt "$LIMIT_BYTES" ]; then
+            split -b 1900M -d -a 3 "$FILE" "${FILE}.part"
+            echo "split=true" >> "$GITHUB_OUTPUT"
+            ls "${FILE}.part"* > release-assets.txt
+          else
+            echo "split=false" >> "$GITHUB_OUTPUT"
+            echo "$FILE" > release-assets.txt
+          fi
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          MIN_ZOOM: ${{ inputs.min_zoom }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+        run: |
+          FILE="${OUTPUT_BASENAME}.pmtiles"
+          # Replacing a fixed tag means deleting first; expected to fail,
+          # and ignored, on a repo's very first run. See docs/ARCHITECTURE.md
+          # "Releasing".
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          # Ready-made download line for the release notes, so a reader
+          # never has to reassemble split parts by hand.
+          DL_CMD="gh release download $TAG --repo ${{ github.repository }}"
+          if [ "${{ steps.split.outputs.split }}" = "true" ]; then
+            UNIX_CMD="$DL_CMD && cat ${FILE}.part* > $FILE"
+            WIN_CMD="$DL_CMD && copy /b ${FILE}.part* $FILE"
+          else
+            UNIX_CMD="$DL_CMD"
+            WIN_CMD="$DL_CMD"
+          fi
+          printf '%s\n' \
+            "${TITLE}, min_zoom=${MIN_ZOOM}, max_zoom=${MAX_ZOOM}." \
+            "Built $(date -u +%Y-%m-%d) (run #${{ github.run_number }})." \
+            "" \
+            "Download (requires the [GitHub CLI](https://cli.github.com/)):" \
+            "" \
+            '**macOS / Linux:**' \
+            '```' \
+            "$UNIX_CMD" \
+            '```' \
+            "" \
+            '**Windows (cmd.exe):**' \
+            '```' \
+            "$WIN_CMD" \
+            '```' \
+            > release-notes.md
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            $(cat release-assets.txt)

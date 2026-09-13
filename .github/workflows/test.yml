@@ -1,0 +1,90 @@
+name: Test
+
+# Calls the real _pipeline.yml, the one thing every caller actually runs,
+# with the real shipped profiles, instead of a hand-rolled shell replica of
+# its steps: a replica drifts the moment _pipeline.yml changes and nothing
+# here would catch it.
+#
+# It runs against real OpenFreeMap data on purpose: real OSM geometry is
+# what turns up the GEOS edge cases a water profile has to survive, and
+# hand-built polygons do not reproduce them. worker_count 1 and a low
+# max_zoom keep that to one shard and about a minute instead of a full
+# multi-hour production run: prepare-shards downloads only the part of the
+# archive's directory index the zoom range needs (see pmtiles_index.py),
+# tens of kilobytes rather than the archive's full ~96 MB.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The profiles come from another repository, which is exactly why this
+  # works: _pipeline.yml takes them as an artifact and never checks a
+  # caller's repository out (see docs/ARCHITECTURE.md "Getting the profiles
+  # in"), so tilealchemist, which ships no profiles of its own, can hand
+  # it somebody else's. Deliberately unpinned: testing against that repo's
+  # current main means a profile that breaks over there shows up here, and
+  # the failing step says which of the two it was.
+  profiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: foxandfeature/tilealchemist-standardprofiles
+          ref: main
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: profiles
+          path: "*.py"
+
+  # Both profiles in one call, the shape a production run uses: one
+  # prepare-shards walk and one fetch per worker shared between them.
+  pipeline:
+    needs: profiles
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      profile: ./land.py,./cropped_waterways.py
+      profile_artifact: profiles
+      output_basename: land,cropped-waterways
+      min_zoom: "0"
+      # The whole world, capped low: tile data roughly triples per extra
+      # zoom level, so this is the one knob that makes the run meaningfully
+      # more expensive.
+      max_zoom: "4"
+      worker_count: "1"
+      attribution: "CI test run, not for real use"
+
+  # A run that writes nothing still exits 0, so the pipeline succeeding
+  # above does not cover the one failure that looks like success.
+  check-tiles:
+    needs: pipeline
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        output_basename: [land, cropped-waterways]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.output_basename }}-pmtiles
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install pmtiles
+
+      - name: Check the run produced tiles
+        env:
+          OUTPUT_BASENAME: ${{ matrix.output_basename }}
+        run: |
+          python3 -c '
+          import os
+          from pmtiles.reader import Reader, MmapSource
+          path = os.environ["OUTPUT_BASENAME"] + ".pmtiles"
+          with open(path, "rb") as f:
+              count = Reader(MmapSource(f)).header()["addressed_tiles_count"]
+          print(f"{path}: {count} tiles")
+          assert count > 0, f"no tiles written to {path}"
+          '

@@ -1,0 +1,36 @@
+[project]
+name = "tilealchemist"
+version = "0.1.0"
+description = "Generate global PMTiles layers from OpenStreetMap-derived PMTiles sources via pluggable per-tile processing profiles."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "pmtiles",
+    "requests",
+    "mapbox-vector-tile",
+    # Already pulled in by mapbox-vector-tile, which needs it to encode
+    # geometry; named explicitly because tilealchemist's own code imports it
+    # too (mvt.py snaps output geometry onto the encoder's integer grid,
+    # water.py does the water overlay math).
+    #
+    # >=2.1 for make_valid()'s `method=` argument, which water.py needs: its
+    # default "linework" repair punches a hole through the overlap it is
+    # fixing, and only `method="structure"` merges it (see _compute_union()).
+    "shapely>=2.1",
+]
+
+[project.urls]
+Repository = "https://github.com/foxandfeature/tilealchemist"
+
+[project.scripts]
+tilealchemist-prepare-shards = "tilealchemist.prepare_shards:main"
+tilealchemist-build-shard = "tilealchemist.build_shard:main"
+tilealchemist-profile-requirements = "tilealchemist.profile_requirements:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tilealchemist*"]

@@ -1,0 +1,323 @@
+name: TileAlchemist pipeline (reusable)
+
+# Builds one or more profiles' world-covering PMTiles layers: prepare-shards
+# walks the source archive once, build-shards runs every profile's per-tile
+# transform against the same fetched bytes across `worker_count` parallel
+# workers, merge joins each profile's own shards into its own .pmtiles file.
+#
+# Deliberately publishes nowhere (no GitHub Release, no B2 upload): that's
+# the calling workflow's job. Every caller is a separate repository (see
+# foxandfeature/tilealchemist-standardprofiles for a real one) calling this via
+# `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
+#
+# Profiles arrive as an artifact the caller uploads before calling, never
+# from a checkout done here: this pipeline has no opinion about which
+# repository a profile lives in, or whether it was committed to one at all.
+# See docs/ARCHITECTURE.md "Getting the profiles in".
+#
+# See docs/ARCHITECTURE.md "Publishing" for the rest of the reusable-workflow
+# contract: the `<output_basename>-pmtiles` artifact-name interface, why
+# nothing is published from here, and why every job below checks out
+# tilealchemist by name instead of finding it in the workspace. Also
+# "Fetching"/"Parallelism" for why one fetch per worker covers every
+# profile.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: 'Path(s) to a profile''s .py file to apply, resolved inside the unpacked profile_artifact (any dependency it declares in its own inline PEP 723 block is installed automatically): one value, or a comma-separated list matched 1:1 with output_basename, e.g. "./my_profile.py" or "./land.py,./cropped_waterways.py".'
+        required: true
+        type: string
+      profile_artifact:
+        description: 'Name of an artifact the calling workflow uploaded before calling this one, holding every .py file `profile` names. Unpacked into the workspace root, so a profile stored at your repository root is reached as "./my_profile.py" either way.'
+        required: true
+        type: string
+      source:
+        description: 'tilealchemist.sources entry to resolve the PMTiles archive from.'
+        required: false
+        type: string
+        default: "openfreemap"
+      source_url:
+        description: 'PMTiles URL to use; required when source is "static-url".'
+        required: false
+        type: string
+        default: ""
+      min_zoom:
+        required: false
+        type: string
+        default: "0"
+      max_zoom:
+        required: false
+        type: string
+        default: "14"
+      worker_count:
+        description: "How many parallel shard-building jobs to fan out into. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\")."
+        required: false
+        type: string
+        default: "128"
+      output_basename:
+        description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
+        required: true
+        type: string
+      attribution:
+        description: "HTML attribution string embedded in every profile's merged PMTiles metadata via tile-join --attribution."
+        required: true
+        type: string
+
+jobs:
+  prepare-shards:
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.gen-workers.outputs.workers }}
+      profile_pairs: ${{ steps.gen-pairs.outputs.profile_pairs }}
+    steps:
+      - name: Validate profile/output_basename line up 1:1
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          IFS=',' read -ra BASENAME_ENTRIES <<< "$OUTPUT_BASENAME"
+          if [ "${#PROFILE_ENTRIES[@]}" -ne "${#BASENAME_ENTRIES[@]}" ]; then
+            echo "::error::profile has ${#PROFILE_ENTRIES[@]} entries but output_basename has ${#BASENAME_ENTRIES[@]}; must match 1:1"
+            exit 1
+          fi
+
+      # Both are empty on GitHub Enterprise Server, where an empty `ref`
+      # would silently check the default branch out instead. Asserted here,
+      # in the run's first job, rather than in all three; see
+      # docs/ARCHITECTURE.md "Getting the profiles in".
+      - name: Validate the tilealchemist checkout resolves
+        env:
+          TILEALCHEMIST_REPOSITORY: ${{ job.workflow_repository }}
+          TILEALCHEMIST_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$TILEALCHEMIST_REPOSITORY" ] || [ -z "$TILEALCHEMIST_SHA" ]; then
+            echo "::error::job.workflow_repository/job.workflow_sha are empty (they are not available on GitHub Enterprise Server), so the tilealchemist checkouts below can't be resolved"
+            exit 1
+          fi
+          echo "tilealchemist: ${TILEALCHEMIST_REPOSITORY}@${TILEALCHEMIST_SHA}"
+
+      # This job runs no profile; it downloads them only so a path that
+      # isn't in the artifact fails here, in seconds, instead of identically
+      # in every one of `worker_count` build-shards cells after the archive
+      # walk has already run.
+      - name: Download the caller's profiles
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.profile_artifact }}
+          path: profiles
+
+      - name: Validate every profile path is in the artifact
+        env:
+          PROFILE: ${{ inputs.profile }}
+          PROFILE_ARTIFACT: ${{ inputs.profile_artifact }}
+        run: |
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
+            if [ ! -f "profiles/$PROFILE_PATH" ]; then
+              echo "::error::profile '$PROFILE_PATH' is not in the '$PROFILE_ARTIFACT' artifact; it holds: $(cd profiles && find . -name '*.py' | sort | tr '\n' ' ')"
+              exit 1
+            fi
+          done
+
+      # tilealchemist alone: no caller repository is ever checked out here.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tilealchemist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tilealchemist
+        run: pip install ./.tilealchemist
+
+      - name: Walk archive directory and partition into per-worker manifests
+        env:
+          MIN_ZOOM: ${{ inputs.min_zoom }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+          SOURCE: ${{ inputs.source }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: |
+          ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
+          if [ -n "$SOURCE_URL" ]; then
+            ARGS+=(--source-url "$SOURCE_URL")
+          fi
+          tilealchemist-prepare-shards "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-manifests
+          path: manifests
+
+      - id: gen-workers
+        name: Generate worker index matrix
+        env:
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+      - id: gen-pairs
+        name: Generate profile/output-basename pairs
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          echo "profile_pairs=$(python3 -c '
+          import json, os
+          profiles = os.environ["PROFILE"].split(",")
+          basenames = os.environ["OUTPUT_BASENAME"].split(",")
+          print(json.dumps([{"profile": p, "output_basename": b} for p, b in zip(profiles, basenames)]))
+          ')" >> "$GITHUB_OUTPUT"
+
+  build-shards:
+    needs: prepare-shards
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare-shards.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tilealchemist
+
+      # The only job that needs a profile at all, and it takes it from the
+      # caller's artifact rather than checking the caller's repository out:
+      # that way a profile can come from anywhere the calling workflow can
+      # produce a file. Unpacked at the workspace root so the paths in
+      # `profile` read the same as a repo-relative path would.
+      - name: Download the caller's profiles
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.profile_artifact }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # A profile's own dependencies come from the PEP 723 block inside its
+      # own .py file, read without importing it, since importing would need
+      # those very dependencies first. See docs/PROFILES.md ("Writing and
+      # distributing your own profile") and profile_requirements.py.
+      - name: Install tilealchemist and every profile's own dependencies
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          pip install ./.tilealchemist
+
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
+            REQUIREMENTS="$RUNNER_TEMP/profile-requirements.txt"
+            tilealchemist-profile-requirements "$PROFILE_PATH" > "$REQUIREMENTS"
+            if [ -s "$REQUIREMENTS" ]; then
+              pip install -r "$REQUIREMENTS"
+            fi
+          done
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shard-manifests
+          path: manifests
+
+      - name: "Build this worker's tile shard(s)"
+        env:
+          PROFILE: ${{ inputs.profile }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          WORKER_ID=$(printf '%03d' ${{ matrix.worker }})
+          IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
+          OUT_PATHS=()
+          for BASENAME in "${BASENAMES[@]}"; do
+            OUT_PATHS+=("${BASENAME}-shard-${{ matrix.worker }}.mbtiles")
+          done
+          OUT_JOINED=$(IFS=,; echo "${OUT_PATHS[*]}")
+          tilealchemist-build-shard \
+            --worker-index ${{ matrix.worker }} \
+            --profile "$PROFILE" \
+            --manifest "manifests/worker-${WORKER_ID}.bin" \
+            --source manifests/source.json \
+            --out "$OUT_JOINED"
+
+      # A missing file is expected, not a failure, and one artifact per
+      # worker can't collide across profiles; see docs/ARCHITECTURE.md
+      # "Worker independence".
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shards-${{ matrix.worker }}
+          path: "*-shard-${{ matrix.worker }}.mbtiles"
+          if-no-files-found: ignore
+
+  merge:
+    needs: [prepare-shards, build-shards]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ${{ fromJson(needs.prepare-shards.outputs.profile_pairs) }}
+    steps:
+      # tilealchemist alone, only for throttle_progress.sh below.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tilealchemist
+
+      # Every cell downloads every profile's shards and uses only its own,
+      # by the filename prefix below; see docs/ARCHITECTURE.md "Publishing".
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shards-*
+          path: shards
+          merge-multiple: true
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tippecanoe || {
+            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+            make -C /tmp/tippecanoe -j"$(nproc)"
+            sudo make -C /tmp/tippecanoe install
+          }
+
+      # tile-join rewrites a `z/x/y` progress line in place with \r;
+      # throttled for the same reason as the worker logs (see README), while
+      # warnings and errors pass straight through.
+      - name: Merge this profile's shards into its final layer
+        env:
+          ATTRIBUTION: ${{ inputs.attribution }}
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
+        run: |
+          tile-join --no-tile-size-limit \
+            --attribution="$ATTRIBUTION" \
+            -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \
+            | .tilealchemist/tilealchemist/throttle_progress.sh 60
+
+      - name: Summarize
+        env:
+          OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: |
+          SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
+          SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
+          {
+            echo "### ${OUTPUT_BASENAME} layer"
+            echo "- profile: ${{ matrix.pair.profile }}"
+            echo "- min_zoom: ${{ inputs.min_zoom }}"
+            echo "- max_zoom: ${{ inputs.max_zoom }}"
+            echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
+            echo "- output size: $SIZE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pair.output_basename }}-pmtiles
+          path: ${{ matrix.pair.output_basename }}.pmtiles
