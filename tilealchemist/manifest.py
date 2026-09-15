@@ -18,8 +18,10 @@ section for why entries are stored in ascending offset order and what
 `run_length` is used for.
 
 `source.json` carries what is true for the whole run rather than for one
-worker: which archive to fetch from, the zoom bounds it was walked at, and
-the tile-data base offset every manifest offset is relative to.
+worker: which archive to fetch from, which schema its tiles are in, the zoom
+bounds it was walked at, and the tile-data base offset every manifest offset
+is relative to. The schema rides along here for the same reason the URL does:
+both are what `prepare_shards.py` resolved, not a worker's own opinion.
 """
 import json
 import os
@@ -59,6 +61,7 @@ def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom, tile_dat
         json.dump({
             "url": resolved_source.url,
             "build": resolved_source.build,
+            "schema": resolved_source.schema.name,
             "min_zoom": min_zoom,
             "max_zoom": max_zoom,
             "tile_data_offset": tile_data_offset,
