@@ -43,6 +43,16 @@ on:
         required: false
         type: string
         default: ""
+      schema:
+        description: 'tilealchemist.schemas entry naming how the source archive''s layers are structured ("openmaptiles", "protomaps"). Required when source is "static-url" and not accepted otherwise: every other source names the schema its provider publishes. A profile never names a schema at all; it asks for feature sets whichever schema answers (see docs/PROFILES.md).'
+        required: false
+        type: string
+        default: ""
+      artifact_namespace:
+        description: 'Name to prefix this call''s own internal artifacts with (shard manifests, per-worker shards) -- pass "name", not "name-", the separator is added here. Only needed when one workflow run calls this pipeline more than once, since two calls would otherwise upload the same artifact names; namespacing the second is enough, an unnamespaced call''s names being no prefix of a namespaced one''s. The published `<output_basename>-pmtiles` artifacts are unaffected, their names being unique already.'
+        required: false
+        type: string
+        default: ""
       min_zoom:
         required: false
         type: string
@@ -142,17 +152,21 @@ jobs:
           MAX_ZOOM: ${{ inputs.max_zoom }}
           SOURCE: ${{ inputs.source }}
           SOURCE_URL: ${{ inputs.source_url }}
+          SCHEMA: ${{ inputs.schema }}
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: |
           ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi
+          if [ -n "$SCHEMA" ]; then
+            ARGS+=(--schema "$SCHEMA")
+          fi
           tilealchemist-prepare-shards "${ARGS[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: shard-manifests
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
           path: manifests
 
       - id: gen-workers
@@ -223,7 +237,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: shard-manifests
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
           path: manifests
 
       - name: "Build this worker's tile shard(s)"
@@ -251,7 +265,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shards-${{ matrix.worker }}
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-${{ matrix.worker }}
           path: "*-shard-${{ matrix.worker }}.mbtiles"
           if-no-files-found: ignore
 
@@ -275,7 +289,7 @@ jobs:
       - name: Download all shard artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: shards-*
+          pattern: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-*
           path: shards
           merge-multiple: true
 

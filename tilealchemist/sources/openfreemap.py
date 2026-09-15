@@ -6,6 +6,7 @@ import re
 
 import requests
 
+from tilealchemist.schemas import OPENMAPTILES
 from tilealchemist.sources.base import ResolvedSource, Source
 
 FILES_URL = "https://btrfs.openfreemap.com/files.txt"
@@ -14,6 +15,8 @@ PLANET_RE = re.compile(r"^areas/planet/(\d{8}_\d{6})_pt/(.+)$")
 
 
 class OpenFreeMapSource(Source):
+    schema = OPENMAPTILES
+
     def resolve(self):
         """See README.md ("Method") for why `done` + tiles.pmtiles, not just
         the newest directory listed."""
@@ -31,4 +34,5 @@ class OpenFreeMapSource(Source):
         if not ready:
             raise RuntimeError(f"no fully-published planet build found in {FILES_URL}")
         latest = max(ready)
-        return ResolvedSource(f"{BASE_URL}areas/planet/{latest}_pt/tiles.pmtiles", latest)
+        return ResolvedSource(f"{BASE_URL}areas/planet/{latest}_pt/tiles.pmtiles", latest,
+                              self.schema)

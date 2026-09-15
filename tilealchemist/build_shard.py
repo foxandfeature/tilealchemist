@@ -30,7 +30,6 @@ import os
 
 from tilealchemist.fetch_batching import DEFAULT_MAX_FETCH_GAP
 from tilealchemist.profiles import load_profile
-from tilealchemist.schemas import SCHEMAS
 from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
 
@@ -47,7 +46,9 @@ def parse_args():
     parser.add_argument("--worker-index", type=int, required=True)
     parser.add_argument("--manifest", required=True,
                          help="this worker's manifest file from prepare_shards.py")
-    parser.add_argument("--source", required=True, help="source.json written by prepare_shards.py")
+    parser.add_argument("--source", required=True,
+                         help="source.json written by prepare_shards.py, which names the archive, "
+                              "the schema its tiles are in, and the zoom range walked")
     parser.add_argument("--out", required=True,
                          help="comma-separated output mbtiles path(s), one per --profile, "
                               "matched by position")
@@ -55,8 +56,6 @@ def parse_args():
                          help="comma-separated path(s) to a profile's .py file to apply, e.g. "
                               "\"./my_profile.py\" or "
                               "\"./my_profile.py,./other_profile.py\"")
-    parser.add_argument("--schema", choices=sorted(SCHEMAS), default="openmaptiles",
-                         help="which source tile schema to read (default openmaptiles)")
     parser.add_argument("--report-interval", type=float, default=DEFAULT_REPORT_INTERVAL,
                          help="seconds between throttled transform-progress updates (default 60; "
                               "download-progress updates have their own "

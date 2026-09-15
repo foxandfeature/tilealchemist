@@ -28,7 +28,8 @@ def feature(feature_set, *, fields=None):
 
 
 class TileSchema(ABC):
-    name: str                    # CLI-facing `--schema` value, for messages
+    name: str                    # SCHEMAS key: what a Source declares, what
+                                 # source.json carries, what --schema names
     default_buffer_pixels: int   # edge-buffer geometry this schema's tiles carry
     default_extent: int          # MVT extent assumed for a layerless tile
     tile_size_pixels: int = 256
@@ -45,6 +46,9 @@ class TileSchema(ABC):
             if (method := getattr(cls, attribute_name, None)) is not None
             and hasattr(method, "feature_set")
         }
+
+    def __repr__(self):
+        return f"<TileSchema {self.name}>"
 
     def extract(self, feature_set, layers):
         """`feature_set`'s features out of `layers`, raw as decoded. Called by
@@ -107,10 +111,67 @@ class OpenMapTilesSchema(TileSchema):
         return waterway["features"]
 
 
-OPENMAPTILES = OpenMapTilesSchema()
+# `water` holds polygons, lines and label points in one layer, so
+# ProtomapsSchema tells them apart by the geometry type
+# `mapbox_vector_tile.decode()` writes into each feature's geometry dict.
+POLYGON_TYPES = {"Polygon", "MultiPolygon"}
+LINE_TYPES = {"LineString", "MultiLineString"}
 
-# CLI-facing registry, mirroring sources/__init__.py's SOURCES: a second schema
+
+class ProtomapsSchema(TileSchema):
+    """Protomaps' own basemap schema (v4), as its daily planet builds carry
+    it: no waterway layer at all. Water polygons, waterway lines and water
+    label points share one `water` layer, told apart by geometry type, which
+    is how Protomaps' own styles read it too (their water fill layer filters
+    `["==", "$type", "Polygon"]`).
+    """
+    name = "protomaps"
+    # The basemap's Water.java/Earth.java call `setBufferPixels(8)` on water
+    # polygons and on `earth`; water *lines* keep Planetiler's default 4. The
+    # wider of the two is the safe default: a profile reasoning about tile
+    # edges has to cover the polygons that reach the full 8. Confirmed against
+    # build 20260908 at extent 4096: polygons run to -128..4224, lines to
+    # -64..4160.
+    default_buffer_pixels = 8
+    # As for OpenMapTiles above: what Planetiler encodes at, consulted only for
+    # a tile with no layer to read an extent from.
+    default_extent = 4096
+
+    @feature(SURFACE_WATER)
+    def surface_water(self, layers):
+        """Every polygon in `water`, minus tunnels. No `kind` is filtered out
+        (ocean, lake, playa, reef...): Protomaps' own style paints them all as
+        water. `tunnel` is only encoded from z14 (`extraAttrMinzoom` in
+        Water.java), so below that zoom no polygon declares itself one."""
+        water = layers.get("water")
+        if not water:
+            return []
+        return [
+            polygon
+            for polygon in water["features"]
+            if polygon["geometry"]["type"] in POLYGON_TYPES
+            and polygon["properties"].get("tunnel", "no") == "no"
+        ]
+
+    # What Protomaps sets on a water *line*. The localized `name:<lang>`,
+    # `name2` and `script` variants ride along on the features themselves;
+    # `kind_detail`, `bridge` and `tunnel` are polygon-only in this basemap.
+    @feature(WATERWAYS, fields={"kind": "String", "name": "String",
+                                "layer": "Number", "min_zoom": "Number",
+                                "sort_rank": "Number"})
+    def waterways(self, layers):
+        water = layers.get("water")
+        if not water:
+            return []
+        return [line for line in water["features"]
+                if line["geometry"]["type"] in LINE_TYPES]
+
+
+OPENMAPTILES = OpenMapTilesSchema()
+PROTOMAPS = ProtomapsSchema()
+
+# CLI-facing registry, mirroring sources/__init__.py's SOURCES: another schema
 # is its own TileSchema subclass instance plus one entry here, no other code
 # changes. docs/PROFILES.md says why this stays a hardcoded dict while profiles
 # are resolved from a path instead.
-SCHEMAS = {OPENMAPTILES.name: OPENMAPTILES}
+SCHEMAS = {schema.name: schema for schema in (OPENMAPTILES, PROTOMAPS)}
