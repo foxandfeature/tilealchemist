@@ -12,6 +12,12 @@ name: Test
 # multi-hour production run: prepare-shards downloads only the part of the
 # archive's directory index the zoom range needs (see pmtiles_index.py),
 # tens of kilobytes rather than the archive's full ~96 MB.
+#
+# It runs twice, once per source/schema pair the repository ships, because
+# the two differ in more than a URL: a Protomaps build lays its directory
+# index out the other way round (leaf directories after the tile data) and
+# names and structures its layers differently (see ProtomapsSchema). Only a
+# real run against each catches a regression in either.
 
 on:
   push:
@@ -40,7 +46,7 @@ jobs:
 
   # Both profiles in one call, the shape a production run uses: one
   # prepare-shards walk and one fetch per worker shared between them.
-  pipeline:
+  pipeline-openfreemap:
     needs: profiles
     uses: ./.github/workflows/_pipeline.yml
     with:
@@ -55,15 +61,45 @@ jobs:
       worker_count: "1"
       attribution: "CI test run, not for real use"
 
+  # The same world, the same zoom range, read through the other source and
+  # schema: proves ProtomapsSource picks a build out of the daily index and
+  # that ProtomapsSchema finds water in what comes back.
+  #
+  # `land` alone, where the OpenFreeMap call runs both profiles, because
+  # Protomaps encodes no waterway lines this far out: rivers appear at z9,
+  # canals and streams deeper still (z11 and up). Pairing
+  # `cropped_waterways.py` in here would assert tiles out of a layer that is
+  # correctly empty, and covering it honestly would mean a z9 run: ~1 GB of
+  # tile data against this one's ~6 MB, which is no longer a per-push test.
+  pipeline-protomaps:
+    needs: profiles
+    uses: ./.github/workflows/_pipeline.yml
+    with:
+      profile: ./land.py
+      profile_artifact: profiles
+      output_basename: land-protomaps
+      # No `schema:` anywhere here: ProtomapsSource names its own, which is
+      # the point of picking a source at all.
+      source: protomaps
+      min_zoom: "0"
+      max_zoom: "4"
+      worker_count: "1"
+      # Both calls land in the same workflow run, and the pipeline names the
+      # artifacts it hands between its own jobs per pipeline, not per call.
+      # Namespacing this one is enough: the other's `shards-*` doesn't reach
+      # into `protomaps-shards-*` (see _pipeline.yml's `artifact_namespace`).
+      artifact_namespace: "protomaps"
+      attribution: "CI test run, not for real use"
+
   # A run that writes nothing still exits 0, so the pipeline succeeding
   # above does not cover the one failure that looks like success.
   check-tiles:
-    needs: pipeline
+    needs: [pipeline-openfreemap, pipeline-protomaps]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        output_basename: [land, cropped-waterways]
+        output_basename: [land, cropped-waterways, land-protomaps]
     steps:
       - uses: actions/download-artifact@v4
         with:

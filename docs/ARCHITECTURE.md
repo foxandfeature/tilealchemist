@@ -10,14 +10,52 @@ For what a profile actually computes, see
 ## Source resolution
 
 `Source.resolve()` (`tilealchemist/sources/`) finds the PMTiles archive URL
-to read from, independent of which profile is running.
+to read from, independent of which profile is running, and says which schema
+that archive's tiles are in.
+
+Both, not just the URL. A provider publishes one schema, not a different one
+per build, so which schema to decode through is the source's own property
+rather than a second thing a caller has to get right alongside it: `--source
+protomaps` cannot be read as OpenMapTiles by accident, because there is no
+flag left with which to say so. A source declares the `TileSchema` itself,
+not a name for it, so a declaration cannot be misspelled into a lookup that
+fails somewhere downstream; the name it travels under appears once it has
+to cross a file, in `source.json` (`manifest.py`), which is also what keeps
+a worker from disagreeing with the walk about it. That closes a failure that is otherwise silent rather
+than loud: both schemas here have a `water` layer, so a run pairing one
+provider's archive with the other's schema doesn't crash, it produces
+plausible nonsense — OpenMapTiles' reader would take a Protomaps tile's
+waterway lines and label points for water polygons and filter them on a
+`brunnel` attribute that isn't there.
+
 `OpenFreeMapSource.resolve()` (the default) re-resolves on every run:
 `files.txt` is scanned for the newest `areas/planet/<timestamp>_pt/`
 directory that has **both** a `done` marker and a `tiles.pmtiles` file (the
 very newest directory listed isn't necessarily done converting yet).
+
+`ProtomapsSource` (`--source protomaps`) re-resolves the same way against a
+different shape of listing: `build-metadata.protomaps.dev/builds.json` names
+every build in the bucket, and the newest build *date* wins, not the newest
+entry, because the index also keeps the last build of each older basemap
+version around. It needs no equivalent of the `done` marker: the index is
+generated from the bucket's object listing, where an object appears only
+once its upload has finished. Re-resolving every run is not optional here
+the way it nearly is for OpenFreeMap, since Protomaps keeps only the last
+seven days of daily builds, so any build named in a workflow file would be
+a 404 within the week.
+
 `StaticUrlSource` (`--source static-url --source-url ...`) skips that
 resolution for any other PMTiles provider that just publishes one file at a
-stable location.
+stable location. It is the one source that cannot name its own schema, a
+bare URL being nobody's provider in particular, so it is the one that takes
+`--schema` (the pipeline's `schema` input) and requires it. Passing one to
+any other source is refused rather than ignored: a `--schema` that
+contradicts what the source publishes is a misunderstanding worth stopping
+for, and one that agrees is merely redundant. It is also the way to read a copy of your own, which is
+what Protomaps asks for if a *deployed* map is what would be reading it
+(docs.protomaps.com/basemaps/downloads discourages hotlinking their builds,
+whose URLs can move); one archive walk per build run is the download that
+page describes, not the serving it warns about.
 
 ## Fetching: directory-driven, not one request per tile
 
@@ -42,17 +80,32 @@ community-run server. Instead:
 
    The walk itself issues no requests at all, and only the part of the
    index it will actually read comes down. `collect_entries()` fetches a
-   64 KB prefix holding the 127-byte header and the root directory, works
+   16 KB prefix holding the 127-byte header and the root directory, works
    out from the root alone which leaf directories the zoom range needs, and
-   fetches exactly that span. Leaf pointers are sorted by tile-ID in the
-   root and the leaves sit in that same order in the file, so the needed
-   ones are a single contiguous byte range, still two requests for the
-   entire run, however deep the tree. This matters: a planet archive's leaf
-   section is ~96 MB, while a z0..z5 run needs ~29 KB of it. An archive
-   nested deeper than root + leaves can put a directory outside that span;
-   the walk raises `LeafOutsideWindow` and `collect_entries()` answers by
-   refetching the whole section, so correctness never rests on the layout
-   assumption.
+   fetches exactly that span: two requests for the entire run. 16 KB is not
+   a guess -- PMTiles v3 (spec section 4) requires header plus root to fit
+   in the first 16,384 bytes precisely so one blind fetch can get them, so
+   the root never needs a request of its own. The pruning matters: a planet
+   archive's leaf section is ~96 MB, while a z0..z5 run needs ~29 KB of it.
+
+   The span is the first to the last leaf the root points into, which relies
+   on two things the same spec section asks of writers: leaf order SHOULD
+   ascend by tile-ID, and more than one level of leaf directories is
+   discouraged. Neither is a MUST, so both are checked rather than trusted --
+   `LeafWindow.node_bytes()` raises on any pointer outside the span instead
+   of slicing whatever bytes sit there. Reading such an archive would mean
+   pulling the whole leaf section, and no published archive is built that
+   way (verified against OpenFreeMap and Protomaps planet builds, whose root
+   pointers tile their leaf section back-to-back with no gaps), so it errors
+   out rather than carrying a fallback path that never runs.
+
+   Nor does it rest on where in the file that section *is*: the header says,
+   and writers disagree. OpenFreeMap's archives run
+   Header/Root/Metadata/LeafDirs/TileData, Protomaps' daily builds put the
+   leaf directories and metadata *after* 137 GB of tile data, and both read
+   identically here because every offset comes out of the header rather than
+   out of an assumed order. A run reads 29 KB of OpenFreeMap's index and
+   132 KB of a Protomaps build's for z0..z4.
 2. It sorts entries by *offset* (not tile-ID) and splits them into
    `--worker-count` (the reusable pipeline's `worker_count` input, default
    128) **contiguous** chunks, one per worker (`tilealchemist/partition.py`,
@@ -195,7 +248,9 @@ receiving live instances: profiles loaded via `load_profile()`'s
 `sys.modules`, so the default pickler used to hand work to a pool worker
 can't reconstruct them there. `.github/workflows/test.yml` runs both of
 these paths against real OpenFreeMap data on every push/PR, as a normal
-low-zoom run rather than as a separate test.
+low-zoom run rather than as a separate test, and runs a second one against
+a real Protomaps build alongside it (see that file for why the two calls
+aren't symmetric).
 
 Each chunk's output is written to its profile's mbtiles as soon as that
 chunk comes back, then dropped: `run_transform()` yields each chunk's
@@ -252,7 +307,8 @@ coordination, shared state, and a failure mode, and buy nothing.
 `.github/workflows/_pipeline.yml` is a **reusable** workflow
 (`on: workflow_call`) containing only `prepare-shards` → `build-shards` →
 `merge`, parameterized by `profile`, `profile_artifact`, `source`,
-`output_basename`, and `attribution`. `profile`/`output_basename` each take
+`output_basename`, and `attribution` (plus `schema`, which only a
+`static-url` source needs; see "Source resolution"). `profile`/`output_basename` each take
 one value (e.g. `profile: ./land.py`) or a comma-separated list
 matched 1:1 (e.g. `output_basename: land,cropped-waterways`), so
 `prepare-shards` and each worker's fetch happen once per run regardless of
@@ -275,6 +331,29 @@ artifacts and picks its own out by filename prefix, even on a single-profile
 run where there is only one set to download. That costs CI-internal
 bandwidth and nothing else: the source archive is never touched again after
 `build-shards`.
+
+One more input exists for one situation: `artifact_namespace`. The artifacts
+the pipeline passes between its own jobs (`shard-manifests`, `shards-<n>`)
+are named per pipeline, not per call, which two calls in the *same* workflow
+run would collide over — GitHub rejects a second upload of a name already
+taken in a run. A caller doing that (this repo's `test.yml`, running the
+same profiles against two different sources) names one of them, and its
+artifacts become `<namespace>-shard-manifests` and `<namespace>-shards-<n>`.
+Callers that call the pipeline once, which is nearly all of them, never set
+it.
+
+A prefix rather than a suffix, because the `merge` job globs for the shards
+it merges and a prefix is what makes those globs disjoint for free. An
+unnamespaced call's `shards-*` cannot reach into `protomaps-shards-0`, so
+namespacing the *second* call is enough and the first is left alone; with a
+suffix, `shards-*-protomaps` would still have matched a hypothetical third
+call's `shards-0-x-protomaps`, and every call would have had to be named to
+be safe. It also groups an Actions run's artifact list by call rather than
+by artifact kind, which is the more useful order at 128 workers.
+
+The published `<output_basename>-pmtiles` artifacts take no namespace: two
+calls in one run need distinct output basenames anyway, or their outputs
+would collide by that name instead.
 
 ### Getting the profiles in
 

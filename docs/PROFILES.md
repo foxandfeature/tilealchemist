@@ -272,15 +272,22 @@ across schemas.
 
 **Why behavior instead of a plain layer-name lookup table:** schemas can
 differ *structurally*, not just by naming, in ways a name-to-name dict can't
-express. Concrete example (checked against Shortbread's real
-[1.0 schema docs](https://shortbread-tiles.org/schema/1.0/), not assumed):
-OpenMapTiles keeps all water in one `water` polygon layer with a single
-string tunnel/bridge attribute; Shortbread splits water across two layers
-(`ocean`, `water_polygons`) and uses two boolean fields instead, with no
-tunnel concept on polygons at all. A `TileSchema` subclass for a schema
-shaped like that writes its own `surface_water()`; the existing `land`/
-`cropped-waterways` profiles then work against it unmodified, since neither
-reads a layer or attribute name off a schema directly.
+express. The two shipped here are already an example. OpenMapTiles keeps
+water polygons in a `water` layer and waterway lines in a separate
+`waterway` one, both classified by a single string `brunnel` attribute;
+Protomaps has no waterway layer at all, putting polygons, lines and label
+points in one `water` layer told apart by *geometry type*, and sets
+`tunnel` (raw OSM tag, z14 and up) on polygons only. No pair of layer names
+maps one onto the other, but both answer `SURFACE_WATER` and `WATERWAYS`,
+so the `land`/`cropped-waterways` profiles read either unmodified: neither
+profile names a layer or an attribute anywhere.
+
+Schemas this pipeline doesn't ship differ again in the same way. Shortbread
+(checked against its real [1.0 schema
+docs](https://shortbread-tiles.org/schema/1.0/), not assumed) splits water
+across an `ocean` and a `water_polygons` layer and uses two boolean fields,
+with no tunnel concept on polygons at all; a subclass for it writes its own
+`surface_water()` and nothing else in the pipeline moves.
 
 **Why feature sets aren't fixed abstract methods on the ABC:** so that a
 profile for a domain no schema covers yet (buildings, landuse, POIs) is
@@ -294,10 +301,20 @@ sets: they describe the *tile format itself* (how much edge-buffer geometry
 its tiles carry, and what pixel size that's relative to), the same for any
 profile reasoning about tile edges, regardless of what layer it's looking at.
 
-Only one schema (`openmaptiles`) exists today, but the registry it's
-selected from (`--schema`, defaulting to `openmaptiles`, in
-`tilealchemist/schemas.py`'s `SCHEMAS` dict) is already in place for a
-second one to be added as its own `TileSchema` subclass plus one entry.
+Two schemas exist today, `openmaptiles` and `protomaps`. A third is its own
+`TileSchema` subclass plus one `SchemaName` member and one entry in
+`tilealchemist/schemas.py`'s `SCHEMAS` dict, and nothing else: no profile,
+and no other module, changes. A schema's `name` is that `SchemaName` member
+rather than a bare string, so the one name that travels between processes
+and files (`source.json`, `--schema`, a transform pool worker) is a closed
+set every reader can check against.
+
+Which one a run reads is not usually a choice at all: a `Source` names the
+schema its provider publishes, and `prepare_shards.py` writes that name into
+`source.json` alongside the URL it resolved, so every worker reads the
+archive through the schema the archive is actually in. See
+docs/ARCHITECTURE.md "Source resolution" for the one source that has to be
+told (`static-url`) and what `--schema` does there.
 
 ## No compatibility checks needed
 

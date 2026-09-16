@@ -55,6 +55,15 @@ what each tile turns into, a **`Source`** decides where the input PMTiles
 archive comes from, and a **`TileSchema`** decides what its layers/attributes
 are actually called.
 
+What ships today: the `openfreemap` and `protomaps` sources (plus
+`static-url` for a fixed URL of your own), and the `openmaptiles` and
+`protomaps` schemas. **A source names its own schema**, so picking
+`--source protomaps` is the whole decision — there is no second flag to get
+wrong, and no way to read a Protomaps build as OpenMapTiles by accident.
+`--source static-url` is the one exception, a bare URL being nobody's
+provider in particular: it requires `--schema`, and every other source
+refuses one rather than quietly ignoring it.
+
 - [`docs/PROFILES.md`](docs/PROFILES.md): the `Profile`/`TileSchema`
   contracts and how to write and distribute a profile of your own.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): `Source` resolution,
@@ -70,7 +79,7 @@ else.
 | --- | --- |
 | `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel, merges into one `.pmtiles` artifact per profile. Never publishes. Safe to call cross-repo. |
 | `.github/workflows/_publish-release.yml` | Reusable: publishes a merged `.pmtiles` artifact as a GitHub Release. Safe to call cross-repo. |
-| `.github/workflows/test.yml` | CI: a real low-zoom run against live OpenFreeMap data, built with [tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)' profiles, on every push and PR. |
+| `.github/workflows/test.yml` | CI: real low-zoom runs against live OpenFreeMap *and* Protomaps data, built with [tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)' profiles, on every push and PR. |
 | `pyproject.toml` | Packaging: dependencies and console scripts. A profile needing anything beyond these declares it inline, in a PEP 723 block in its own `.py` file. |
 | `tilealchemist/prepare_shards.py` | The run's entry point: parses its flags, then hands off to `shard_prep.py`. |
 | `tilealchemist/shard_prep.py` | The run's one-time planning step: resolves the `Source`, drives the walk and the partition, writes the manifests, logs the run. Needs a `Source`, not a `Profile`. |
@@ -83,13 +92,14 @@ else.
 | `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile, writing real and gap tiles into it (including the XYZ-to-TMS row flip). |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |
-| `tilealchemist/sources/` | The `Source` ABC, plus `OpenFreeMapSource` and `StaticUrlSource`. |
-| `tilealchemist/schemas.py` | The `TileSchema` ABC, its `@feature` feature sets, `OpenMapTilesSchema`, and the `SCHEMAS` registry. |
+| `tilealchemist/sources/` | The `Source` ABC (which archive URL to read, and which schema its tiles are in), plus `OpenFreeMapSource`, `ProtomapsSource` and `StaticUrlSource`. |
+| `tilealchemist/schemas.py` | The `TileSchema` ABC, its `@feature` feature sets, `OpenMapTilesSchema` and `ProtomapsSchema`, and the `SchemaName` enum / `SCHEMAS` registry. |
+| `tilealchemist/zoom.py` | The `ZoomLevel` enum (the levels a run can be walked at) and the `MAX_SUPPORTED_ZOOM` limit behind it. |
 | `tilealchemist/features.py` | The vocabulary a profile works in: `Feature` (shapely geometry + properties) and the `FeatureSet` constants a profile asks a schema for. |
 | `tilealchemist/tile.py` | The `Tile` a profile's `transform()` is handed: decoded layers, extent, schema feature sets, per-tile memoization. |
 | `tilealchemist/mvt.py` | Gzip+MVT decode/encode helper any profile can use, including output grid snapping. |
 | `tilealchemist/water.py` | Geometry math offered to water-related profiles; used by no other module here, only by profiles that ask for it. |
-| `tilealchemist/manifest.py` | Both sides of everything `shard_prep.py` hands the workers: the binary per-worker manifest format, and the shared `source.json`. |
+| `tilealchemist/manifest.py` | Both sides of everything `shard_prep.py` hands the workers: the binary per-worker manifest format, and the shared `source.json` (as the `SourceMetadata` record a worker reads it back into). |
 | `tilealchemist/ranged_fetch.py` | HTTP Range fetching against the source archive (session, retry/backoff, 206 enforcement, download progress), shared by `pmtiles_index.py`/`fetch_batching.py`. |
 | `tilealchemist/backoff.py`, `tilealchemist/throttle.py`, `tilealchemist/throttle_progress.sh` | HTTP retry backoff, throttled progress logging. |
 
@@ -119,9 +129,15 @@ The code in this repository (package, workflows) is licensed under
 the [MIT License](LICENSE).
 
 The `.pmtiles` files themselves are a different matter: their data is
-derived from OpenStreetMap via OpenFreeMap's planet archive, built with
-OpenMapTiles (© OpenStreetMap contributors, ODbL), and that license carries
-through however it's reshaped or repackaged downstream. Each layer carries
+derived from OpenStreetMap, via OpenFreeMap's planet archive built with
+OpenMapTiles or via Protomaps' daily basemap builds (© OpenStreetMap
+contributors, ODbL either way), and that license carries through however
+it's reshaped or repackaged downstream. Both sources publish their archives
+as ODbL Produced Works requiring visible `© OpenStreetMap` attribution, so
+a layer built from either is under the same obligation; a Protomaps build
+additionally carries public-domain Natural Earth data and, in its
+`landcover` layer only, CC-BY-4.0 data that would need its own attribution
+if a profile ever read that layer (none here does). Each layer carries
 its attribution in its own PMTiles metadata, so a style reading it through
 the [PMTiles protocol](https://github.com/protomaps/PMTiles) picks it up
 automatically; see
