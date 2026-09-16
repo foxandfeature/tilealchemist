@@ -69,5 +69,5 @@ def fetch_batch_blob(session, batch, batch_label, worker_index, source, report_i
     print(f"starting download{batch_label} ({batch_length} bytes, {len(batch_entries)} entries "
           f"in a single range request)", file=sys.stderr)
     return fetch_range(
-        session, source["url"], source["tile_data_offset"] + batch_offset, batch_length,
+        session, source.url, source.tile_data_offset + batch_offset, batch_length,
         retry_label=f"worker {worker_index}", on_chunk=progress.update)

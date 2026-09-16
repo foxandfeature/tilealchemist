@@ -20,8 +20,9 @@ writing the blocks out in the form build_shard.py reads back.
 import argparse
 
 from tilealchemist.pmtiles_index import MAX_SUPPORTED_ZOOM
+from tilealchemist.schemas import SCHEMAS
 from tilealchemist.shard_prep import run_prepare
-from tilealchemist.sources import SOURCES
+from tilealchemist.sources import SOURCES, resolve_source
 
 
 def zoom_level_type(value):
@@ -44,10 +45,21 @@ def parse_args():
                          help="where to resolve the PMTiles archive from (default openfreemap)")
     parser.add_argument("--source-url", default=None,
                          help="the PMTiles URL to use, required when --source static-url")
+    parser.add_argument("--schema", choices=sorted(SCHEMAS), default=None,
+                         help="which schema the archive's tiles are in, required when --source "
+                              "static-url and not accepted otherwise: every other source says "
+                              "what its provider publishes (see sources/base.py)")
     args = parser.parse_args()
 
     if args.min_zoom > args.max_zoom:
         parser.error(f"--min-zoom ({args.min_zoom}) must not exceed --max-zoom ({args.max_zoom})")
+    # Built here only to turn a bad --source/--source-url/--schema combination
+    # into a usage error instead of a traceback out of the run; run_prepare()
+    # builds the one it actually resolves. Costs nothing, touching no network.
+    try:
+        resolve_source(args.source, args.source_url, args.schema)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
