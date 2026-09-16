@@ -51,9 +51,11 @@ def split_manifest_entries(entries):
 
 def run_worker(args):
     source = read_source_metadata(args.source)
-    schema = SCHEMAS[args.schema]
+    # From the source, not a flag of this worker's own, so no worker can
+    # disagree with the walk about how to read what it fetched.
+    schema = SCHEMAS[source.schema]
     profiles = [profile_class() for profile_class in args.profile_classes]
-    print(f"source={source['url']} (build {source['build']}), "
+    print(f"source={source.url} (build {source.build}, schema {schema.name}), "
           f"profiles={', '.join(profile.name for profile in profiles)}", file=sys.stderr)
 
     entries = read_manifest(args.manifest)
@@ -61,7 +63,7 @@ def run_worker(args):
     print(f"{len(real_entries)} real entries + {len(gap_entries)} gap ranges assigned",
           file=sys.stderr)
 
-    connections = [init_mbtiles(out, source["min_zoom"], source["max_zoom"], profile, schema)
+    connections = [init_mbtiles(out, source.min_zoom, source.max_zoom, profile, schema)
                     for out, profile in zip(args.out, profiles)]
 
     # Empty shard: nothing assigned to this worker at all.
@@ -73,7 +75,7 @@ def run_worker(args):
     counts = [ProfileTileCounts() for _ in profiles]
 
     if real_entries:
-        _process_real_entries(real_entries, args, source, profiles, connections, counts)
+        _process_real_entries(real_entries, args, source, schema, profiles, connections, counts)
     if gap_entries:
         _process_gap_entries(gap_entries, schema, profiles, connections, counts)
 
@@ -84,7 +86,7 @@ def run_worker(args):
               f"skipped={profile_counts.skipped} -> {out}", file=sys.stderr)
 
 
-def _process_real_entries(real_entries, args, source, profiles, connections, counts):
+def _process_real_entries(real_entries, args, source, schema, profiles, connections, counts):
     """One batch at a time, fetched once and then transformed for every
     profile together against those same bytes (see
     run_transform()/transform_batch_blob_multi()). Usually there is exactly
@@ -99,8 +101,8 @@ def _process_real_entries(real_entries, args, source, profiles, connections, cou
         batch_label = f" {batch_index}/{len(batches)}" if len(batches) > 1 else ""
         blob = fetch_batch_blob(session, batch, batch_label, args.worker_index, source,
                                  args.download_report_interval)
-        for chunk_results in run_transform(blob, batch, source["min_zoom"],
-                                            source["max_zoom"], profiles, args):
+        for chunk_results in run_transform(blob, batch, source.min_zoom,
+                                            source.max_zoom, profiles, schema, args):
             for profile_counts, profile_results, connection in zip(
                     counts, chunk_results, connections):
                 profile_counts.add(*write_output_tiles(profile_results, connection))

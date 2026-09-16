@@ -216,14 +216,15 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
             yield index, entry_count, byte_count, future.result()
 
 
-def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
+def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
     """Runs the transform phase, yielding one chunk's results at a time: a
     list of per-profile result lists, matched to `profiles` by position, in
     the shape write_output_tiles() (mbtiles.py) takes. The CPU-bound work
     (decode, transform, encode) is what fans out across cores; `blob` was
-    fetched once, sequentially, before this was called. `args` is the
-    worker's parsed command line, for the four flags this phase reads:
-    --transform-workers, --profile, --schema and --report-interval.
+    fetched once, sequentially, before this was called. `schema` is the one
+    the run's source.json named (see shard_worker.py); `args` is the worker's
+    parsed command line, for the three flags this phase reads:
+    --transform-workers, --profile and --report-interval.
 
     A single chunk (always the case under `--transform-workers 1`) runs
     inline, rather than paying a process for one call. Progress doesn't
@@ -248,10 +249,13 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, args):
     if len(chunks) <= 1:
         transform_progress = TransformProgress(len(real_entries), args.report_interval)
         yield transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress,
-                                         profiles, SCHEMAS[args.schema])
+                                         profiles, schema)
         return
 
-    job = ChunkJob(args.profile, args.schema, min_zoom, max_zoom, args.report_interval)
+    # The schema crosses into a pool worker as its SchemaName, not as the
+    # object: the child looks the same singleton up out of SCHEMAS (see
+    # _transform_chunk).
+    job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
     for done, (index, entry_count, byte_count, chunk_results) in enumerate(
             _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers),
             start=1):

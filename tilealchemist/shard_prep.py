@@ -33,8 +33,9 @@ from tilealchemist.sources import resolve_source
 def run_prepare(args):
     os.makedirs(args.out_dir, exist_ok=True)
 
-    resolved_source = resolve_source(args.source, args.source_url).resolve()
-    print(f"source={resolved_source.url} (build {resolved_source.build})", file=sys.stderr)
+    resolved_source = resolve_source(args.source, args.source_url, args.schema).resolve()
+    print(f"source={resolved_source.url} (build {resolved_source.build}, "
+          f"schema {resolved_source.schema.name})", file=sys.stderr)
 
     header, entries = collect_entries(make_session(), resolved_source.url,
                                        args.min_zoom, args.max_zoom)

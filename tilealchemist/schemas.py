@@ -7,8 +7,24 @@ asks for one by object, never by layer name. See docs/PROFILES.md
 ("`TileSchema`") for the full contract and the reasoning behind it.
 """
 from abc import ABC
+from enum import StrEnum
 
 from tilealchemist.features import SURFACE_WATER, WATERWAYS
+
+
+class SchemaName(StrEnum):
+    """Every schema this repo ships, as the name that crosses every boundary:
+    what a `Source` declares, what `source.json` carries, what `--schema`
+    accepts, what a transform pool worker rebuilds its schema from. A closed
+    set rather than a bare string, so a name that is not one of these is a
+    ValueError where it is read, not a KeyError deep inside a worker.
+
+    A StrEnum because the two boundaries it crosses are textual and stay
+    that way: JSON writes the member as its plain value, and argparse shows
+    and matches it as one (see prepare_shards.py's schema_type()).
+    """
+    OPENMAPTILES = "openmaptiles"
+    PROTOMAPS = "protomaps"
 
 
 def feature(feature_set, *, fields=None):
@@ -28,7 +44,7 @@ def feature(feature_set, *, fields=None):
 
 
 class TileSchema(ABC):
-    name: str                    # SCHEMAS key: what a Source declares, what
+    name: SchemaName             # SCHEMAS key: what a Source declares, what
                                  # source.json carries, what --schema names
     default_buffer_pixels: int   # edge-buffer geometry this schema's tiles carry
     default_extent: int          # MVT extent assumed for a layerless tile
@@ -68,7 +84,7 @@ class TileSchema(ABC):
         except KeyError:
             available = ", ".join(sorted(each.name for each in self.provides))
             raise KeyError(
-                f"schema {self.name!r} provides no feature set "
+                f"schema '{self.name}' provides no feature set "
                 f"{feature_set.name!r} (it provides: {available})") from None
         return getattr(self, name)
 
@@ -79,7 +95,7 @@ class OpenMapTilesSchema(TileSchema):
     and a single `waterway` line layer, tunnel/bridge/ford classification via
     one string attribute (`brunnel`).
     """
-    name = "openmaptiles"
+    name = SchemaName.OPENMAPTILES
     # Planetiler's own default buffer (`defaultBufferPixels` in
     # FeatureCollector), left unchanged by OpenMapTiles for `water`/`waterway`
     # (`BUFFER_SIZE` in OpenMapTilesSchema.java). Label layers override it much
@@ -125,7 +141,7 @@ class ProtomapsSchema(TileSchema):
     is how Protomaps' own styles read it too (their water fill layer filters
     `["==", "$type", "Polygon"]`).
     """
-    name = "protomaps"
+    name = SchemaName.PROTOMAPS
     # The basemap's Water.java/Earth.java call `setBufferPixels(8)` on water
     # polygons and on `earth`; water *lines* keep Planetiler's default 4. The
     # wider of the two is the safe default: a profile reasoning about tile
@@ -171,7 +187,7 @@ OPENMAPTILES = OpenMapTilesSchema()
 PROTOMAPS = ProtomapsSchema()
 
 # CLI-facing registry, mirroring sources/__init__.py's SOURCES: another schema
-# is its own TileSchema subclass instance plus one entry here, no other code
-# changes. docs/PROFILES.md says why this stays a hardcoded dict while profiles
-# are resolved from a path instead.
+# is its own TileSchema subclass instance, one SchemaName member and one entry
+# here, no other code changes. docs/PROFILES.md says why this stays a hardcoded
+# dict while profiles are resolved from a path instead.
 SCHEMAS = {schema.name: schema for schema in (OPENMAPTILES, PROTOMAPS)}

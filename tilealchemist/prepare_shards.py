@@ -19,33 +19,47 @@ writing the blocks out in the form build_shard.py reads back.
 """
 import argparse
 
-from tilealchemist.pmtiles_index import MAX_SUPPORTED_ZOOM
-from tilealchemist.schemas import SCHEMAS
+from tilealchemist.schemas import SchemaName
 from tilealchemist.shard_prep import run_prepare
 from tilealchemist.sources import SOURCES, resolve_source
+from tilealchemist.zoom import MAX_SUPPORTED_ZOOM, ZoomLevel
 
 
 def zoom_level_type(value):
-    """argparse type shared by --min-zoom and --max-zoom: both accept
-    exactly the same range, so they get exactly one validator."""
-    zoom = int(value)
-    if not (0 <= zoom <= MAX_SUPPORTED_ZOOM):
-        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_SUPPORTED_ZOOM}")
-    return zoom
+    """argparse type shared by --min-zoom and --max-zoom: both accept exactly
+    the same levels, so they get exactly one validator, and both come out of
+    it as the `ZoomLevel` member everything downstream passes around."""
+    zoom = int(value)  # a non-numeric value is argparse's own error to report
+    try:
+        return ZoomLevel(zoom)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_SUPPORTED_ZOOM}") from None
+
+
+def schema_type(value):
+    """argparse type for --schema: the `SchemaName` member this name stands
+    for, so everything downstream of parse_args() handles the enum and not a
+    string that may or may not be one of ours."""
+    try:
+        return SchemaName(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be one of {', '.join(SchemaName)}") from None
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--worker-count", type=int, default=128)
-    parser.add_argument("--min-zoom", type=zoom_level_type, default=0)
-    parser.add_argument("--max-zoom", type=zoom_level_type, default=14)
+    parser.add_argument("--min-zoom", type=zoom_level_type, default=ZoomLevel.Z0)
+    parser.add_argument("--max-zoom", type=zoom_level_type, default=ZoomLevel.Z14)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--source", choices=sorted(SOURCES), default="openfreemap",
                          help="where to resolve the PMTiles archive from (default openfreemap)")
     parser.add_argument("--source-url", default=None,
                          help="the PMTiles URL to use, required when --source static-url")
-    parser.add_argument("--schema", choices=sorted(SCHEMAS), default=None,
+    parser.add_argument("--schema", type=schema_type, choices=list(SchemaName), default=None,
                          help="which schema the archive's tiles are in, required when --source "
                               "static-url and not accepted otherwise: every other source says "
                               "what its provider publishes (see sources/base.py)")
