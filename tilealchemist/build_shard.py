@@ -84,12 +84,10 @@ def parse_args():
     if len(profile_paths) != len(out_paths):
         parser.error(f"--profile has {len(profile_paths)} entries but --out has {len(out_paths)}; "
                       f"they must match 1:1")
-    profile_classes = []
-    for path in profile_paths:
-        try:
-            profile_classes.append(load_profile(path))
-        except ValueError as error:
-            parser.error(str(error))
+    try:
+        profile_classes = [load_profile(path) for path in profile_paths]
+    except ValueError as error:
+        parser.error(str(error))
 
     args.profile = profile_paths
     args.profile_classes = profile_classes

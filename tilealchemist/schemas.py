@@ -43,6 +43,17 @@ def feature(feature_set, *, fields=None):
     return mark
 
 
+def _layer_features(layers, layer_name):
+    """`layer_name`'s decoded features, or [] when this tile carries no such
+    layer (or an empty one). Where every `@feature` method below starts: a
+    schema's layers are whatever the tile happened to encode, so a missing
+    one is ordinary, not an error."""
+    layer = layers.get(layer_name)
+    if not layer:
+        return []
+    return layer["features"]
+
+
 class TileSchema(ABC):
     name: SchemaName             # SCHEMAS key: what a Source declares, what
                                  # source.json carries, what --schema names
@@ -108,12 +119,9 @@ class OpenMapTilesSchema(TileSchema):
 
     @feature(SURFACE_WATER)
     def surface_water(self, layers):
-        water = layers.get("water")
-        if not water:
-            return []
         return [
             polygon
-            for polygon in water["features"]
+            for polygon in _layer_features(layers, "water")
             if polygon["properties"].get("brunnel") != "tunnel"
         ]
 
@@ -121,10 +129,7 @@ class OpenMapTilesSchema(TileSchema):
     @feature(WATERWAYS, fields={"class": "String", "name": "String",
                                 "brunnel": "String", "intermittent": "Boolean"})
     def waterways(self, layers):
-        waterway = layers.get("waterway")
-        if not waterway:
-            return []
-        return waterway["features"]
+        return _layer_features(layers, "waterway")
 
 
 # `water` holds polygons, lines and label points in one layer, so
@@ -159,12 +164,9 @@ class ProtomapsSchema(TileSchema):
         (ocean, lake, playa, reef...): Protomaps' own style paints them all as
         water. `tunnel` is only encoded from z14 (`extraAttrMinzoom` in
         Water.java), so below that zoom no polygon declares itself one."""
-        water = layers.get("water")
-        if not water:
-            return []
         return [
             polygon
-            for polygon in water["features"]
+            for polygon in _layer_features(layers, "water")
             if polygon["geometry"]["type"] in POLYGON_TYPES
             and polygon["properties"].get("tunnel", "no") == "no"
         ]
@@ -176,10 +178,7 @@ class ProtomapsSchema(TileSchema):
                                 "layer": "Number", "min_zoom": "Number",
                                 "sort_rank": "Number"})
     def waterways(self, layers):
-        water = layers.get("water")
-        if not water:
-            return []
-        return [line for line in water["features"]
+        return [line for line in _layer_features(layers, "water")
                 if line["geometry"]["type"] in LINE_TYPES]
 
 

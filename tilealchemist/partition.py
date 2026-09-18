@@ -84,13 +84,12 @@ def partition_evenly(records, worker_count, atomic_key=None):
     blocks = [[] for _ in range(worker_count)]
     worker_index = 0
     assigned_count = 0
-    share_end = _share_end(record_count, worker_index, worker_count)
     for group in groups:
         blocks[worker_index].extend(group)
         assigned_count += len(group)
+        share_end = _share_end(record_count, worker_index, worker_count)
         if assigned_count >= share_end and worker_index < worker_count - 1:
             worker_index += 1
-            share_end = _share_end(record_count, worker_index, worker_count)
     return blocks
 
 

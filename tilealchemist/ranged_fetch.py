@@ -52,16 +52,14 @@ class DownloadProgress:
     def __init__(self, total_bytes, interval, label):
         self.total_bytes = total_bytes
         self.label = label
-        self.downloaded = 0
         self.throttle = UpdateLineThrottle(interval, fire_immediately=True)
 
     def update(self, downloaded):
-        self.downloaded = downloaded
         if not self.throttle.due():
             return
-        percent = (100 * self.downloaded / self.total_bytes) if self.total_bytes else 100.0
+        percent = (100 * downloaded / self.total_bytes) if self.total_bytes else 100.0
         print(f"update: downloading {self.label}: "
-              f"{self.downloaded}/{self.total_bytes} bytes ({percent:.1f}%)",
+              f"{downloaded}/{self.total_bytes} bytes ({percent:.1f}%)",
               file=sys.stderr)
 
 

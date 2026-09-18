@@ -226,9 +226,9 @@ jobs:
         run: |
           pip install ./.tilealchemist
 
+          REQUIREMENTS="$RUNNER_TEMP/profile-requirements.txt"
           IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
           for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
-            REQUIREMENTS="$RUNNER_TEMP/profile-requirements.txt"
             tilealchemist-profile-requirements "$PROFILE_PATH" > "$REQUIREMENTS"
             if [ -s "$REQUIREMENTS" ]; then
               pip install -r "$REQUIREMENTS"
@@ -244,16 +244,17 @@ jobs:
         env:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          WORKER: ${{ matrix.worker }}
         run: |
-          WORKER_ID=$(printf '%03d' ${{ matrix.worker }})
+          WORKER_ID=$(printf '%03d' "$WORKER")
           IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
           OUT_PATHS=()
           for BASENAME in "${BASENAMES[@]}"; do
-            OUT_PATHS+=("${BASENAME}-shard-${{ matrix.worker }}.mbtiles")
+            OUT_PATHS+=("${BASENAME}-shard-${WORKER}.mbtiles")
           done
           OUT_JOINED=$(IFS=,; echo "${OUT_PATHS[*]}")
           tilealchemist-build-shard \
-            --worker-index ${{ matrix.worker }} \
+            --worker-index "$WORKER" \
             --profile "$PROFILE" \
             --manifest "manifests/worker-${WORKER_ID}.bin" \
             --source manifests/source.json \
@@ -318,15 +319,18 @@ jobs:
       - name: Summarize
         env:
           OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
+          PROFILE: ${{ matrix.pair.profile }}
+          MIN_ZOOM: ${{ inputs.min_zoom }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: |
           SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
           SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
           {
             echo "### ${OUTPUT_BASENAME} layer"
-            echo "- profile: ${{ matrix.pair.profile }}"
-            echo "- min_zoom: ${{ inputs.min_zoom }}"
-            echo "- max_zoom: ${{ inputs.max_zoom }}"
+            echo "- profile: ${PROFILE}"
+            echo "- min_zoom: ${MIN_ZOOM}"
+            echo "- max_zoom: ${MAX_ZOOM}"
             echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
             echo "- output size: $SIZE"
           } >> "$GITHUB_STEP_SUMMARY"

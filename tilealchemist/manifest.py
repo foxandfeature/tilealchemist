@@ -49,10 +49,7 @@ def write_manifest(path, entries):
 def read_manifest(path):
     with open(path, "rb") as file:
         data = file.read()
-    return [
-        Entry(*RECORD.unpack_from(data, offset))
-        for offset in range(0, len(data), RECORD.size)
-    ]
+    return [Entry(*fields) for fields in RECORD.iter_unpack(data)]
 
 
 def write_worker_manifests(out_dir, blocks):

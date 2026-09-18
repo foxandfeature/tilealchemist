@@ -14,6 +14,9 @@ import sys
 
 from pmtiles.tile import tileid_to_zxy
 
+INSERT_TILE = ("INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) "
+               "VALUES (?, ?, ?, ?)")
+
 
 class ProfileTileCounts:
     """One profile's running written/skipped totals, accumulated across the
@@ -59,10 +62,7 @@ def write_output_tiles(results, connection):
             skipped += 1
             continue
         tms_row = (2 ** zoom - 1) - tile_row
-        connection.execute(
-            "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-            (zoom, tile_column, tms_row, output_data),
-        )
+        connection.execute(INSERT_TILE, (zoom, tile_column, tms_row, output_data))
         written += 1
     return written, skipped
 
@@ -85,12 +85,11 @@ def write_gap_tiles(gap_entries, connection, output_data):
                 zoom, tile_column, tile_row = tileid_to_zxy(entry.tile_id + run_offset)
                 yield (zoom, tile_column, (2 ** zoom - 1) - tile_row, output_data)
 
-    if output_data is not None:
-        connection.executemany(
-            "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-            tms_rows(),
-        )
-    written, skipped = (total, 0) if output_data is not None else (0, total)
+    if output_data is None:
+        written, skipped = 0, total
+    else:
+        connection.executemany(INSERT_TILE, tms_rows())
+        written, skipped = total, 0
     print(f"gap tiles (no archive entry at all): "
           f"filled {written}, skipped {skipped}", file=sys.stderr)
     return written, skipped

@@ -256,9 +256,8 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
     # object: the child looks the same singleton up out of SCHEMAS (see
     # _transform_chunk).
     job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
-    for done, (index, entry_count, byte_count, chunk_results) in enumerate(
-            _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers),
-            start=1):
+    completed = _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers)
+    for done, (index, entry_count, byte_count, chunk_results) in enumerate(completed, start=1):
         yield chunk_results
         print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
               f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)
