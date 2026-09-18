@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# Throttles \r-redrawn output (a tool repainting one line in place, e.g.
-# tile-join's "z/x/y" or tilemaker's per-tile counters) to at most one line
-# per INTERVAL seconds, most recent wins; \n-terminated lines always print
+# Throttles \r-redrawn output to at most one line per INTERVAL seconds, most
+# recent wins. A \r-redrawing tool repaints one line in place: tile-join's
+# "z/x/y", tilemaker's per-tile counters. \n-terminated lines always print
 # immediately. The split is on which byte ended a chunk, never on message
-# text, so it works for any \r-redrawing tool.
+# text, so it works for any such tool.
 #
-# Particularly worth using ahead of a GitHub Actions log: its viewer doesn't
+# Particularly worth using ahead of a GitHub Actions log. Its viewer does not
 # support \r as an in-place redraw, so a \r-heavy tool piped in unthrottled
-# either floods the log with one line per redraw or renders as one
-# unreadable blob, depending on the step.
+# either floods the log with one line per redraw or renders as one unreadable
+# blob, depending on the step.
 #
-# A pending redraw is dropped, not shown, once a real \n line arrives: that
-# line already proves the tool moved on, and flushing the stale redraw first
-# would leak one progress line per phase transition on any tool that
-# interleaves \n status lines with \r redraws. It is still shown if nothing
-# supersedes it: once INTERVAL seconds pass since the last print, or at EOF.
+# A pending redraw MUST be dropped, not shown, once a real \n line arrives.
+# That line proves the tool moved on, and flushing the stale redraw first
+# would leak one progress line per phase transition on any tool interleaving
+# \n status lines with \r redraws. It is still shown if nothing supersedes
+# it: once INTERVAL seconds pass since the last print, or at EOF.
 #
 # Usage: some_noisy_command 2>&1 | throttle_progress.sh <interval_seconds>
 #
-# No `set -e`: `read`'s non-zero exit on timeout and on EOF is expected here,
+# No `set -e`. `read`'s non-zero exit on timeout and on EOF is expected here,
 # not an error to abort on.
 set -u
 
 interval=$1
 
-# partial: text since the last \r or \n, with its terminator not yet seen.
-# `read` stores what it got before a timeout or EOF, so a line spanning
-# several reads accumulates here.
+# partial: text since the last \r or \n, its terminator not yet seen. `read`
+# stores what it got before a timeout or EOF, so a line spanning several
+# reads accumulates here.
 # pending/pending_set: the latest \r-terminated redraw, waiting to print or
-# to be dropped. The flag is separate because "" is a valid redraw (two \r's
-# in a row with nothing between them).
+# to be dropped. The flag MUST stay separate: "" is a valid redraw, two \r's
+# in a row with nothing between them.
 partial=""
 pending=""
 pending_set=0
@@ -47,10 +47,10 @@ show_pending_if_due() {
   pending_set=0
 }
 
-# Takes one \n-free chunk and keeps only the redraw ending at its last \r:
-# any earlier ones in the same chunk are already superseded, and only one
-# could print per interval anyway. What follows that \r has no terminator
-# yet, so it goes back to waiting in partial.
+# Takes one \n-free chunk and keeps only the redraw ending at its last \r.
+# Earlier ones in the same chunk are already superseded, and only one could
+# print per interval anyway. What follows that \r has no terminator yet, so
+# it goes back to waiting in partial.
 consume() {
   local chunk=$1 head
   if [[ $chunk != *$'\r'* ]]; then
@@ -80,9 +80,9 @@ while :; do
     partial=""
   elif (( status > 128 )); then
     # Timed out waiting for a \n. Either the tool stalled, or it is in a
-    # \r-only phase and this timeout is what paces the redraws. `read` hands
-    # back what it got so far, so either way whatever is left in partial is
-    # the tool's most recent state and belongs in the redraw slot.
+    # \r-only phase and this timeout paces the redraws. `read` hands back
+    # what it got so far, so either way what is left in partial is the
+    # tool's most recent state and belongs in the redraw slot.
     if [[ -n $partial ]]; then
       pending=$partial
       pending_set=1
@@ -94,11 +94,11 @@ while :; do
   fi
 done
 
-# Both can still hold real, never-shown content: pending from a redraw that
-# never came due, partial from output after it. pending is the older one.
+# Both can still hold real, never-shown content. pending is a redraw that
+# never came due, partial is output after it. pending is the older one.
 (( pending_set )) && printf '%s\n' "$pending"
 [[ -n $partial ]] && printf '%s\n' "$partial"
 
-# GitHub Actions runs with pipefail, so a false test above must not become
+# GitHub Actions runs with pipefail, so a false test above MUST NOT become
 # the whole step's exit status.
 exit 0

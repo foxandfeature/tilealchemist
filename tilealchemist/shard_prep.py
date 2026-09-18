@@ -1,8 +1,9 @@
-"""The whole run's one-time planning step, driven by already-parsed CLI
-args: walks a source PMTiles archive's directory tree once and partitions
-the resulting entries (plus computed gaps) into `--worker-count` contiguous
+"""The whole run's one-time planning step, driven by already-parsed CLI args.
+
+Walks a source PMTiles archive's directory tree once and partitions the
+resulting entries, plus computed gaps, into `--worker-count` contiguous
 manifests, one per worker. `prepare_shards.py` owns argument parsing and the
-CLI docstring; it just calls `run_prepare(args)` with the result.
+CLI docstring, and calls `run_prepare(args)` with the result.
 
     run_prepare()
       resolve_source()                sources/: which archive to read
@@ -14,11 +15,10 @@ CLI docstring; it just calls `run_prepare(args)` with the result.
       write_worker_manifests()        manifest.py: worker-NNN.bin
       write_source_metadata()         manifest.py: source.json, shared
 
-Logging to stderr is major lines only: one per phase, no throttled updates
-of its own; the two phases that can take a while (the index download and
-the directory walk) print their own `update: ...` lines from
-pmtiles_index.py. See docs/ARCHITECTURE.md's "Worker logging" for both
-kinds.
+Logging to stderr is major lines only, one per phase, with no throttled
+updates of its own. The two phases that can take a while, the index download
+and the directory walk, print their own `update: ...` lines from
+pmtiles_index.py. See docs/ARCHITECTURE.md "Worker logging" for both kinds.
 """
 import os
 import sys
@@ -42,9 +42,9 @@ def run_prepare(args):
     print(f"directory walk found {len(entries)} distinct tile entries "
           f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})", file=sys.stderr)
 
-    # Gaps: tile_ids the archive has no entry for at all, which the workers
-    # fill from each profile's transform_gap() instead of fetching (see
-    # partition.py's compute_gaps() and shard_worker.py's gap entries).
+    # Gaps are tile_ids the archive has no entry for. Workers fill them from
+    # each profile's transform_gap() instead of fetching; see
+    # partition.py's compute_gaps() and shard_worker.py's gap entries.
     gaps = compute_gaps(entries, args.min_zoom, args.max_zoom)
     gap_tile_count = sum(gap.run_length for gap in gaps)
     print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "

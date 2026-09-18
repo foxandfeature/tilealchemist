@@ -1,20 +1,19 @@
 name: Test
 
-# Calls the real _pipeline.yml, the one thing every caller actually runs,
-# with the real shipped profiles, instead of a hand-rolled shell replica of
-# its steps: a replica drifts the moment _pipeline.yml changes and nothing
-# here would catch it.
+# Calls the real _pipeline.yml with the real shipped profiles, rather than a
+# hand-rolled shell replica of its steps. A replica drifts the moment
+# _pipeline.yml changes, and nothing here would catch it.
 #
-# It runs against real OpenFreeMap data on purpose: real OSM geometry is
-# what turns up the GEOS edge cases a water profile has to survive, and
-# hand-built polygons do not reproduce them. worker_count 1 and a low
-# max_zoom keep that to one shard and about a minute instead of a full
-# multi-hour production run: prepare-shards downloads only the part of the
-# archive's directory index the zoom range needs (see pmtiles_index.py),
-# tens of kilobytes rather than the archive's full ~96 MB.
+# It runs against real OpenFreeMap data on purpose. Real OSM geometry turns
+# up the GEOS edge cases a water profile has to survive; hand-built polygons
+# do not reproduce them. worker_count 1 and a low max_zoom keep that to one
+# shard and about a minute instead of a multi-hour production run.
+# prepare-shards downloads only the part of the archive's directory index the
+# zoom range needs (see pmtiles_index.py): tens of kilobytes rather than the
+# archive's full ~96 MB.
 #
 # It runs twice, once per source/schema pair the repository ships, because
-# the two differ in more than a URL: a Protomaps build lays its directory
+# the two differ in more than a URL. A Protomaps build lays its directory
 # index out the other way round (leaf directories after the tile data) and
 # names and structures its layers differently (see ProtomapsSchema). Only a
 # real run against each catches a regression in either.
@@ -24,13 +23,13 @@ on:
   pull_request:
 
 jobs:
-  # The profiles come from another repository, which is exactly why this
-  # works: _pipeline.yml takes them as an artifact and never checks a
-  # caller's repository out (see docs/ARCHITECTURE.md "Getting the profiles
-  # in"), so tilealchemist, which ships no profiles of its own, can hand
-  # it somebody else's. Deliberately unpinned: testing against that repo's
-  # current main means a profile that breaks over there shows up here, and
-  # the failing step says which of the two it was.
+  # The profiles come from another repository, which is why this works.
+  # _pipeline.yml takes them as an artifact and never checks a caller's
+  # repository out (docs/ARCHITECTURE.md "Getting the profiles in"), so
+  # tilealchemist, shipping no profiles of its own, can hand it somebody
+  # else's. Deliberately unpinned: against that repo's current main, a
+  # profile that breaks over there shows up here, and the failing step says
+  # which of the two it was.
   profiles:
     runs-on: ubuntu-latest
     steps:
@@ -44,8 +43,8 @@ jobs:
           name: profiles
           path: "*.py"
 
-  # Both profiles in one call, the shape a production run uses: one
-  # prepare-shards walk and one fetch per worker shared between them.
+  # Both profiles in one call, the shape a production run uses. One
+  # prepare-shards walk and one fetch per worker, shared between them.
   pipeline-openfreemap:
     needs: profiles
     uses: ./.github/workflows/_pipeline.yml
@@ -54,23 +53,23 @@ jobs:
       profile_artifact: profiles
       output_basename: land,cropped-waterways
       min_zoom: "0"
-      # The whole world, capped low: tile data roughly triples per extra
-      # zoom level, so this is the one knob that makes the run meaningfully
-      # more expensive.
+      # The whole world, capped low. Tile data roughly triples per extra zoom
+      # level, so this is the one knob that makes the run meaningfully more
+      # expensive.
       max_zoom: "4"
       worker_count: "1"
       attribution: "CI test run, not for real use"
 
-  # The same world, the same zoom range, read through the other source and
-  # schema: proves ProtomapsSource picks a build out of the daily index and
-  # that ProtomapsSchema finds water in what comes back.
+  # The same world and zoom range, read through the other source and schema.
+  # Proves ProtomapsSource picks a build out of the daily index, and that
+  # ProtomapsSchema finds water in what comes back.
   #
   # `land` alone, where the OpenFreeMap call runs both profiles, because
-  # Protomaps encodes no waterway lines this far out: rivers appear at z9,
+  # Protomaps encodes no waterway lines this far out. Rivers appear at z9,
   # canals and streams deeper still (z11 and up). Pairing
-  # `cropped_waterways.py` in here would assert tiles out of a layer that is
-  # correctly empty, and covering it honestly would mean a z9 run: ~1 GB of
-  # tile data against this one's ~6 MB, which is no longer a per-push test.
+  # `cropped_waterways.py` here would assert tiles out of a layer that is
+  # correctly empty. Covering it honestly would mean a z9 run: ~1 GB of tile
+  # data against this one's ~6 MB, no longer a per-push test.
   pipeline-protomaps:
     needs: profiles
     uses: ./.github/workflows/_pipeline.yml
@@ -78,7 +77,7 @@ jobs:
       profile: ./land.py
       profile_artifact: profiles
       output_basename: land-protomaps
-      # No `schema:` anywhere here: ProtomapsSource names its own, which is
+      # No `schema:` anywhere here. ProtomapsSource names its own, which is
       # the point of picking a source at all.
       source: protomaps
       min_zoom: "0"
@@ -86,13 +85,13 @@ jobs:
       worker_count: "1"
       # Both calls land in the same workflow run, and the pipeline names the
       # artifacts it hands between its own jobs per pipeline, not per call.
-      # Namespacing this one is enough: the other's `shards-*` doesn't reach
+      # Namespacing this one is enough: the other's `shards-*` does not reach
       # into `protomaps-shards-*` (see _pipeline.yml's `artifact_namespace`).
       artifact_namespace: "protomaps"
       attribution: "CI test run, not for real use"
 
-  # A run that writes nothing still exits 0, so the pipeline succeeding
-  # above does not cover the one failure that looks like success.
+  # A run that writes nothing still exits 0, so the pipeline succeeding above
+  # does not cover the one failure that looks like success.
   check-tiles:
     needs: [pipeline-openfreemap, pipeline-protomaps]
     runs-on: ubuntu-latest

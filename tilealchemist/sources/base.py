@@ -1,7 +1,9 @@
 """Source contract: how to find the PMTiles archive to walk, and what schema
-its tiles are in. Kept separate from the directory-walk/partition mechanics
-behind prepare_shards.py (pmtiles_index.py, partition.py), which never need
-to know how the URL was found, only what it resolved to.
+its tiles are in.
+
+Kept apart from the walk and partition mechanics (pmtiles_index.py,
+partition.py). Those never need to know how the URL was found, only what it
+resolved to.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -17,11 +19,11 @@ class ResolvedSource:
 
 
 class Source(ABC):
-    # What this source's provider publishes, so `--source protomaps` can't be
-    # paired with the wrong reader.
+    # What this source's provider publishes. Pairing `--source protomaps`
+    # with the wrong reader MUST NOT be possible.
     schema: TileSchema
 
     @abstractmethod
     def resolve(self):
-        """Called once by prepare_shards.py before the directory walk.
-        Returns a ResolvedSource."""
+        """Returns a ResolvedSource. Called once by prepare_shards.py, before
+        the directory walk."""

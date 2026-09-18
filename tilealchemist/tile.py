@@ -1,21 +1,18 @@
-"""One source tile as a profile sees it: its decoded layers, the schema that
-explains them, and a place for anything derived from them to be computed once
-and shared.
+"""One source tile as a profile sees it.
 
-transform.py builds one `Tile` per source tile and hands that same object to
-every profile in the run, so the decode (and any expensive intermediate two
-profiles both want, like the water union) happens once per tile rather than
-once per profile. See docs/PROFILES.md for the full rationale.
+Its decoded layers, the schema that explains them, and a place for derived
+values to be computed once and shared. transform.py builds one `Tile` per
+source tile and hands it to every profile in the run, so the decode and any
+expensive intermediate (a water union, say) happens once per tile rather
+than once per profile. See docs/PROFILES.md.
 
-A `Tile` deliberately carries no coordinate: everything on it is tile-local, and
-so identical for every z/x/y that dedupes to the same bytes. That is the
-invariant that lets one object stand for a whole run_length run, for two
-separate entries that point at the same (offset, length), i.e. distinct
-tile_ids the source stores once, which offset-ordered batching makes adjacent
-(both cases in transform_batch_blob_multi() in transform.py), and for a whole
-gap region (one `Tile.empty()` serves a hundred-thousand-tile desert, see
-transform_gap() in profiles/base.py). Adding a coordinate here silently breaks
-all three.
+A `Tile` MUST carry no coordinate. Everything on it is tile-local, hence
+identical for every z/x/y that dedupes to the same bytes. Three things rest
+on that invariant: one object standing for a whole run_length run; one
+standing for two entries pointing at the same (offset, length), which
+offset-ordered batching makes adjacent (both in
+transform_batch_blob_multi()); and one `Tile.empty()` serving a
+hundred-thousand-tile gap region (transform_gap() in profiles/base.py).
 """
 from functools import cached_property
 
@@ -38,19 +35,20 @@ class Tile:
 
     @classmethod
     def empty(cls, schema):
-        """A tile with no layers at all: every feature set comes back empty and
-        `extent` falls back to the schema's `default_extent`. Both a gap tile (a
-        tile_id the source archive has no data for, see shard_worker.py's gap
-        entries) and a real tile whose layers all came back empty amount to this
-        same tile."""
+        """A tile with no layers: every feature set comes back empty, and
+        `extent` falls back to the schema's `default_extent`. Both a gap tile
+        (a tile_id the archive has no data for) and a real tile whose layers
+        all came back empty amount to this one."""
         return cls({}, schema)
 
     @cached_property
     def extent(self):
-        """This tile's MVT coordinate extent. MVT allows one per layer, but a
-        tile in practice encodes every layer at the same extent, so the first
-        layer's is the tile's. A tile with no layers has none to read, and
-        falls back to what the schema says its producer encodes at."""
+        """This tile's MVT coordinate extent.
+
+        MVT allows one per layer, but a tile in practice encodes every layer
+        at the same extent, so the first layer's is the tile's. A tile with
+        no layers falls back to what the schema says its producer encodes
+        at."""
         if not self.layers:
             return self.schema.default_extent
         return next(iter(self.layers.values()))["extent"]
@@ -63,10 +61,10 @@ class Tile:
         return box(-buffer, -buffer, self.extent + buffer, self.extent + buffer)
 
     def features(self, feature_set):
-        """This tile's `Feature`s for `feature_set` (a `FeatureSet`, see
-        features.py), empty if this tile has no such data. Raises KeyError
-        naming what the schema does provide if it can't answer this one.
-        Computed once per tile, however many profiles ask."""
+        """This tile's `Feature`s for `feature_set` (see features.py), empty
+        if it has no such data. Raises KeyError naming what the schema does
+        provide if it cannot answer this one. Computed once per tile, however
+        many profiles ask."""
         return self.derived("features", feature_set, lambda tile: [
             Feature(shape(feature["geometry"]), feature["properties"])
             for feature in tile.schema.extract(feature_set, tile.layers)
@@ -76,14 +74,14 @@ class Tile:
         """`compute(self)`, memoized on this tile under `namespace`/`key`.
 
         The general form of what `features()` does. A profile, or a shared
-        helper like water.py, hangs its own expensive per-tile intermediate
-        here, and the second profile to read the same tile gets it back
-        instead of repeating it.
+        helper like water.py, hangs its expensive per-tile intermediate here.
+        The second profile to read the same tile gets it back instead of
+        repeating it.
 
-        `namespace` is the helper that owns the value, `key` what it calls
-        this one, both any hashable, usually the module name and a string.
-        Splitting them is what keeps two helpers that both memoize a "union"
-        apart, without either having to remember to prefix it."""
+        `namespace` is the helper owning the value, `key` what it calls this
+        one. Both are any hashable, usually a module name and a string.
+        Splitting them keeps two helpers that both memoize a "union" apart
+        without either having to prefix it."""
         memo_key = (namespace, key)
         if memo_key not in self._derived:
             self._derived[memo_key] = compute(self)

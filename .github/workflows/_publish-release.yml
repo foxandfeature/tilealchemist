@@ -1,14 +1,14 @@
 name: Publish a GitHub Release (reusable)
 
 # Downloads a merged .pmtiles artifact from a _pipeline.yml run, splits it
-# into release-sized parts if needed, and publishes/replaces a fixed-tag
+# into release-sized parts if needed, and publishes or replaces a fixed-tag
 # GitHub Release. Called once per layer by a caller repository's own build
 # workflow.
 #
-# Safe to share cross-repo, unlike a job carrying credentials of its own:
-# the release lands in the caller's repo, under the caller's own token. See
-# docs/ARCHITECTURE.md "Releasing" for the tag and split mechanics below,
-# and "Why publishing stops there" for where the line is drawn.
+# Safe to share cross-repo, unlike a job carrying credentials of its own.
+# The release lands in the caller's repo, under the caller's own token.
+# docs/ARCHITECTURE.md "Releasing" has the tag and split mechanics below;
+# "Why publishing stops there" says where the line is drawn.
 
 on:
   workflow_call:
@@ -73,12 +73,12 @@ jobs:
           MAX_ZOOM: ${{ inputs.max_zoom }}
         run: |
           FILE="${OUTPUT_BASENAME}.pmtiles"
-          # Replacing a fixed tag means deleting first; expected to fail,
-          # and ignored, on a repo's very first run. See docs/ARCHITECTURE.md
+          # Replacing a fixed tag means deleting first. Expected to fail, and
+          # ignored, on a repo's first run. See docs/ARCHITECTURE.md
           # "Releasing".
           gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
-          # Ready-made download line for the release notes, so a reader
-          # never has to reassemble split parts by hand.
+          # Ready-made download line for the release notes, so a reader never
+          # has to reassemble split parts by hand.
           DL_CMD="gh release download $TAG --repo ${{ github.repository }}"
           if [ "${{ steps.split.outputs.split }}" = "true" ]; then
             UNIX_CMD="$DL_CMD && cat ${FILE}.part* > $FILE"

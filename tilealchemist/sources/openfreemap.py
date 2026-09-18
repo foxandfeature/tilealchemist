@@ -1,6 +1,7 @@
-"""OpenFreeMap's planet PMTiles archive: a directory of timestamped builds,
-not all fully published, so the latest usable one has to be picked out at
-runtime rather than hardcoded.
+"""OpenFreeMap's planet PMTiles archive.
+
+A directory of timestamped builds, not all fully published, so the latest
+usable one MUST be picked at runtime rather than hardcoded.
 """
 import re
 

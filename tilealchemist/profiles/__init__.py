@@ -1,21 +1,22 @@
-"""Profile loader: a profile is loaded straight from its .py file's path,
-with no registration step and no built-in case to special-case, since this
-package ships no profiles of its own. The file's one required export is a
-module-level `PROFILE` naming its `Profile` subclass, the class rather than
-an instance. Its dependencies, if any, go in that same file too, in a PEP
-723 block that profile_requirements.py reads without importing it. See
-docs/PROFILES.md ("Writing and distributing your own profile").
+"""Profile loader: a profile is loaded straight from its .py file's path.
+
+No registration step, and no built-in case to special-case, since this
+package ships no profiles of its own. The file MUST export a module-level
+`PROFILE` naming its `Profile` subclass — the class, not an instance. Its
+dependencies, if any, go in the same file, in a PEP 723 block
+profile_requirements.py reads without importing it. See docs/PROFILES.md
+("Writing and distributing your own profile").
 """
 import importlib.util
 from pathlib import Path
 
 
 def load_profile(path):
-    """Imports `path` as its own standalone module and returns its
-    module-level `PROFILE` class. Deliberately not registered in
-    sys.modules: transform.py's pool workers reload profiles by path for
-    that reason (see its `_transform_chunk()`), which works under both fork
-    and spawn, whereas registering would only help under fork."""
+    """Imports `path` as a standalone module and returns its `PROFILE` class.
+
+    It MUST NOT be registered in sys.modules. transform.py's pool workers
+    reload profiles by path (see `_transform_chunk()`), which works under
+    both fork and spawn; registering would only help under fork."""
     path = Path(path)
     if not path.is_file():
         raise ValueError(f"profile file not found: {path}")

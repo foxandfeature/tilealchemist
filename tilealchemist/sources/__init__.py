@@ -1,9 +1,8 @@
-"""Source registry: CLI-facing `--source` name -> `Source` class. Unlike
-profiles (see profiles/__init__.py's load_profile(), which resolves every
-profile straight from its .py path, no dict at all), sources have no
-file-path escape hatch for a custom one: they aren't a plugin surface
-external callers need to extend, so a plain dict of this repo's own
-built-ins is the whole registry.
+"""Source registry: CLI-facing `--source` name -> `Source` class.
+
+Sources are not a plugin surface, so a plain dict of this repo's built-ins
+is the whole registry. Profiles differ: load_profile() resolves each one
+from its .py path, with no dict at all.
 """
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.sources.openfreemap import OpenFreeMapSource
@@ -18,11 +17,12 @@ SOURCES = {
 
 
 def resolve_source(source_name, source_url, schema=None):
-    """The `Source` these CLI arguments name, not yet resolved. `schema` is
-    the `--schema` value (a `SchemaName`, argparse having rejected anything
-    that isn't one) or None, and belongs to static-url alone: every other
-    source declares its own, so a contradicting one is refused rather than
-    ignored."""
+    """The `Source` these CLI arguments name, not yet resolved.
+
+    `schema` is the `--schema` value (a `SchemaName`, argparse having
+    rejected anything else) or None. It belongs to static-url alone. Every
+    other source declares its own, and a contradicting `--schema` MUST be
+    refused rather than ignored."""
     if source_name == "static-url":
         if not source_url:
             raise ValueError("--source-url is required when --source static-url")

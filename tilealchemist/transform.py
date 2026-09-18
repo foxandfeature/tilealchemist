@@ -1,14 +1,14 @@
-"""The CPU-bound half of a worker: this worker's already-fetched tile bytes
-in, every profile's output tiles out, optionally fanned out across the
-machine's own cores.
+"""The CPU-bound half of a worker.
 
-Nothing here touches the network, the CLI or sqlite; `shard_worker.py` does
-the fetching, decides what to run, and hands each chunk that comes out of
-here to `mbtiles.py`. See docs/ARCHITECTURE.md "Parallelism" for the design
-this implements (why chunks are balanced on entry count, why there are
-deliberately more chunks than processes, why each chunk is written out and
-dropped as it arrives) and "Worker logging" for the two kinds of stderr
-line.
+Already-fetched tile bytes in, every profile's output tiles out, optionally
+fanned out across the machine's cores.
+
+Nothing here touches the network, the CLI or sqlite. `shard_worker.py` does
+the fetching, decides what to run, and hands each chunk coming out of here
+to `mbtiles.py`. docs/ARCHITECTURE.md "Parallelism" has the design this
+implements: why chunks are balanced on entry count, why there are more
+chunks than processes, why each chunk is written out and dropped as it
+arrives. "Worker logging" has the two kinds of stderr line.
 
     run_transform()                  one shard's whole transform phase,
       _chunk_entries()               yielding a chunk at a time
@@ -30,21 +30,22 @@ from tilealchemist.tile import Tile
 from tilealchemist.throttle import UpdateLineThrottle
 
 
-# How often (seconds) transform update lines are allowed to print, and the
-# minimum time the transform must run before its first update line appears
-# at all. Major phase-transition lines always print regardless.
+# How often (seconds) transform update lines MAY print, and the minimum time
+# the transform must run before its first one appears. Major phase-transition
+# lines always print regardless.
 DEFAULT_REPORT_INTERVAL = 60.0
 
 
 class TransformProgress:
-    """Throttled `update: ...` lines for one transform, whether that is a
-    whole shard (the inline path) or one chunk of it (a pool worker builds
-    its own; see _transform_chunk()). `label` says which, since several
-    processes report into the same stderr.
+    """Throttled `update: ...` lines for one transform.
 
-    Chunks fan out across processes, never threads, so one instance is only
-    ever ticked from a single thread and nothing here needs to be
-    thread-safe (DownloadProgress in ranged_fetch.py is the same)."""
+    That is either a whole shard, on the inline path, or one chunk of it: a
+    pool worker builds its own, see _transform_chunk(). `label` says which,
+    since several processes report into the same stderr.
+
+    Chunks fan out across processes, never threads, so an instance is only
+    ever ticked from one thread and nothing here needs to be thread-safe.
+    DownloadProgress in ranged_fetch.py is the same."""
 
     def __init__(self, total_entries, interval, label="transforming tiles"):
         self.total_entries = total_entries
@@ -66,10 +67,12 @@ class TransformProgress:
 
 def _describe_entry(entry):
     """`entry`'s tile as z/x/y, plus its run length when it stands for more
-    than one tile: an entry is PMTiles' own dedup of consecutive tile_ids
-    sharing the same bytes, so that count is what tells a speck apart from a
-    whole region. It's the entry's own count, before the zoom filter, hence
-    an upper bound on the output tiles behind it."""
+    than one tile.
+
+    An entry is PMTiles' dedup of consecutive tile_ids sharing the same
+    bytes, so that count tells a speck apart from a whole region. It is the
+    entry's own count, before the zoom filter, hence an upper bound on the
+    output tiles behind it."""
     zoom, column, row = tileid_to_zxy(entry.tile_id)
     if entry.run_length == 1:
         return f"tile {zoom}/{column}/{row}"
@@ -78,20 +81,21 @@ def _describe_entry(entry):
 
 def _entry_outputs(tile_data, entry, profiles, schema):
     """Every profile's output for one entry's bytes, decoded once into a
-    single `Tile` (see tile.py) that all of them share: the decode, and any
-    derived value two profiles both need (a water union, say), is computed
-    once per tile rather than once per profile. The `Tile` is dropped when
-    this returns, which bounds that sharing to one tile at a time."""
+    single `Tile` (see tile.py) they all share.
+
+    The decode, and any derived value two profiles both need (a water union,
+    say), is computed once per tile rather than once per profile. The `Tile`
+    is dropped when this returns, bounding that sharing to one tile."""
     tile = Tile.decode(tile_data, schema)
     outputs = []
     for profile in profiles:
         try:
             outputs.append(profile.transform_tile(tile))
         except Exception as error:
-            # Aborting the whole shard is the intent (see mvt.encode_tile()'s
-            # on_invalid_geometry note); catching here only buys the context
-            # nothing above can supply, since the exception itself carries
-            # just geometry and every caller sees a whole batch.
+            # Aborting the whole shard is the intent; see mvt.encode_tile()'s
+            # on_invalid_geometry note. Catching here only buys the context
+            # nothing above can supply: the exception carries just geometry,
+            # and every caller sees a whole batch.
             raise RuntimeError(
                 f"profile {profile.name!r} failed on {_describe_entry(entry)}") from error
     return outputs
@@ -100,17 +104,18 @@ def _entry_outputs(tile_data, entry, profiles, schema):
 def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles,
                                 schema):
     """Every profile's output tiles for `batch`: one list per profile,
-    matched to `profiles` by position, holding one (zoom, tile_column,
-    tile_row, output_data) tuple per *output tile*: an entry with
-    run_length > 1 yields that many, and tiles outside [min_zoom, max_zoom]
-    are dropped.
+    matched to `profiles` by position.
+
+    Each list holds one (zoom, tile_column, tile_row, output_data) tuple per
+    *output tile*. An entry with run_length > 1 yields that many, and tiles
+    outside [min_zoom, max_zoom] are dropped.
 
     Offset-based partitioning can group duplicate bytes into one worker, on
-    top of PMTiles' per-entry run_length dedup (see docs/ARCHITECTURE.md
+    top of PMTiles' per-entry run_length dedup (docs/ARCHITECTURE.md
     "Fetching"). Entries arrive in offset order, so a duplicate pair is
-    adjacent here: holding the previous entry's (offset, length) and
-    outputs skips the repeat for every profile at once, one check per entry
-    rather than one per profile per entry."""
+    adjacent here. Holding the previous entry's (offset, length) and outputs
+    skips the repeat for every profile at once: one check per entry rather
+    than one per profile per entry."""
     batch_offset, _batch_length, batch_entries = batch
     results = [[] for _ in profiles]
     previous_key = None
@@ -131,23 +136,24 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
 
 
 # How many transform chunks to create per worker process. Equal entry counts
-# do not mean equal cost, so the spare chunks let a process that finishes
-# early pull the next one instead of idling. See docs/ARCHITECTURE.md
-# "Parallelism" for the run this value was measured from.
+# do not mean equal cost, so the spare chunks let a process finishing early
+# pull the next one instead of idling. docs/ARCHITECTURE.md "Parallelism"
+# names the run this value was measured from.
 TRANSFORM_CHUNKS_PER_WORKER = 8
 
 
 def _chunk_entries(real_entries, transform_workers):
     """`real_entries` split into contiguous chunks of about
     len(real_entries) / (transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
-    entries each, in their original order. Entry count is the balance, not
-    cumulative bytes or run_length, the rule partition.py's
-    partition_evenly() documents in full.
+    entries each, in their original order.
 
-    Contiguity and order are load-bearing: _blob_slice_for_chunk() slices
-    one byte range per chunk, and transform_batch_blob_multi()'s dedup only
-    compares against the previous entry (a pair split across a boundary
-    misses that one dedup, harmlessly).
+    Entry count is the balance, not cumulative bytes or run_length — the rule
+    partition.py's partition_evenly() documents in full.
+
+    Contiguity and order MUST hold. _blob_slice_for_chunk() slices one byte
+    range per chunk, and transform_batch_blob_multi()'s dedup compares only
+    against the previous entry. A duplicate pair split across a boundary
+    misses that one dedup, harmlessly.
 
     A single chunk (`transform_workers <= 1`, or fewer than two entries)
     keeps run_transform() on its inline, no-pool path."""
@@ -160,32 +166,35 @@ def _chunk_entries(real_entries, transform_workers):
 
 def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
     """This chunk's own bytes out of `blob`, plus the absolute offset they
-    start at: a pool worker gets only its share pickled to it, and indexes
-    into that slice with the very `entry.offset - batch_offset` arithmetic
-    transform_batch_blob_multi() already applies to a full batch."""
+    start at.
+
+    A pool worker gets only its share pickled to it, and indexes into that
+    slice with the same `entry.offset - batch_offset` arithmetic
+    transform_batch_blob_multi() applies to a full batch."""
     chunk_offset = chunk_entries[0].offset
     chunk_length = max(entry.offset + entry.length for entry in chunk_entries) - chunk_offset
     start = chunk_offset - batch_offset
     return blob[start:start + chunk_length], chunk_offset
 
 
-# What every chunk of one run needs, as one picklable value. `args` itself
-# can't take this role: parse_args() hangs the loaded profile classes on it,
-# and those are precisely what a worker process cannot unpickle.
+# What every chunk of one run needs, as one picklable value. `args` cannot
+# take this role: parse_args() hangs the loaded profile classes on it, and
+# those are precisely what a worker process cannot unpickle.
 ChunkJob = collections.namedtuple(
     "ChunkJob", "profile_paths schema_name min_zoom max_zoom report_interval")
 
 
 def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries, chunk_index):
-    """Runs in a pool worker process (see run_transform()). Two things it
-    needs cannot cross a process boundary and are rebuilt here: the
-    profiles, which the pickler cannot reconstruct in a worker at all (see
-    docs/ARCHITECTURE.md "Parallelism"), reimported once per chunk, not per
-    tile; and its TransformProgress, whose throttle holds a threading.Lock.
+    """Runs in a pool worker process; see run_transform().
 
-    Only that object is unpicklable, not the reporting: the interval is a
-    plain float, so a worker throttles its own lines over its own chunk
-    (hence the label), while the parent's "chunk N done" lines carry the
+    Two things it needs cannot cross a process boundary and are rebuilt here.
+    The profiles, which the pickler cannot reconstruct in a worker at all
+    (docs/ARCHITECTURE.md "Parallelism"), are reimported once per chunk, not
+    per tile. Its TransformProgress holds a threading.Lock in its throttle.
+
+    Only that object is unpicklable, not the reporting. The interval is a
+    plain float, so a worker throttles its own lines over its own chunk,
+    hence the label, while the parent's "chunk N done" lines carry the
     whole-shard view."""
     profiles = [load_profile(path)() for path in job.profile_paths]
     batch = (blob_slice_offset, len(blob_slice), chunk_entries)
@@ -199,11 +208,11 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
     """Yields (chunk index, entry count, byte count, that chunk's results) as
     each chunk finishes, in completion order.
 
-    Every chunk is submitted up front: ProcessPoolExecutor's own call queue
-    is then the work queue, handing each pending chunk to whichever process
-    returns first, the mechanism TRANSFORM_CHUNKS_PER_WORKER's spare chunks
-    exist for. Yielding on completion, rather than returning a list, is what
-    lets shard_worker.py drop each chunk as it goes; see run_transform()."""
+    Every chunk is submitted up front. ProcessPoolExecutor's call queue is
+    then the work queue, handing each pending chunk to whichever process
+    returns first — the mechanism TRANSFORM_CHUNKS_PER_WORKER's spare chunks
+    exist for. Yielding on completion, rather than returning a list, lets
+    shard_worker.py drop each chunk as it goes; see run_transform()."""
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         pending = {}
         for index, chunk in enumerate(chunks):
@@ -217,26 +226,26 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
 
 
 def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
-    """Runs the transform phase, yielding one chunk's results at a time: a
-    list of per-profile result lists, matched to `profiles` by position, in
-    the shape write_output_tiles() (mbtiles.py) takes. The CPU-bound work
-    (decode, transform, encode) is what fans out across cores; `blob` was
-    fetched once, sequentially, before this was called. `schema` is the one
-    the run's source.json named (see shard_worker.py); `args` is the worker's
-    parsed command line, for the three flags this phase reads:
-    --transform-workers, --profile and --report-interval.
+    """Runs the transform phase, yielding one chunk's results at a time.
 
-    A single chunk (always the case under `--transform-workers 1`) runs
-    inline, rather than paying a process for one call. Progress doesn't
-    hinge on that: every transform throttles its own `update: ...` lines
-    (see TransformProgress), over the whole shard inline or over one chunk
-    in a worker. Only the parent knows where the run as a whole stands,
-    which is what the "chunk N done" line below reports.
+    Each yield is a list of per-profile result lists, matched to `profiles`
+    by position, in the shape write_output_tiles() (mbtiles.py) takes. The
+    CPU-bound work — decode, transform, encode — is what fans out across
+    cores; `blob` was fetched once, sequentially, before this was called.
+    `schema` is the one the run's source.json named (see shard_worker.py).
+    `args` is the worker's parsed command line, for the three flags this
+    phase reads: --transform-workers, --profile and --report-interval.
 
-    Yielding per chunk, rather than every chunk at once, lets shard_worker.py
-    write each out and drop it: holding a whole shard's transformed output
-    ran a worker out of memory in production (see docs/ARCHITECTURE.md
-    "Parallelism")."""
+    A single chunk, always the case under `--transform-workers 1`, runs
+    inline rather than paying a process for one call. Progress does not hinge
+    on that: every transform throttles its own `update: ...` lines (see
+    TransformProgress), over the whole shard inline or over one chunk in a
+    worker. Only the parent knows where the run as a whole stands, which is
+    what the "chunk N done" line below reports.
+
+    Yielding per chunk lets shard_worker.py write each out and drop it.
+    Holding a whole shard's transformed output ran a worker out of memory in
+    production (docs/ARCHITECTURE.md "Parallelism")."""
     batch_offset, _batch_length, real_entries = batch
     chunks = _chunk_entries(real_entries, args.transform_workers)
 
@@ -253,8 +262,8 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
         return
 
     # The schema crosses into a pool worker as its SchemaName, not as the
-    # object: the child looks the same singleton up out of SCHEMAS (see
-    # _transform_chunk).
+    # object. The child looks the same singleton up out of SCHEMAS; see
+    # _transform_chunk().
     job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
     completed = _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers)
     for done, (index, entry_count, byte_count, chunk_results) in enumerate(completed, start=1):

@@ -5,14 +5,12 @@ import time
 class UpdateLineThrottle:
     """Rate-limits a worker's `update:` lines to at most one per `interval`.
 
-    By default the first `due()` has to wait out a full interval like any
-    other: TransformProgress and the pmtiles directory walk are meant to
-    stay silent when their step finishes before that (see
-    docs/ARCHITECTURE.md's "Worker logging"). `fire_immediately=True`
-    instead makes the very first call due, for curl's progress-meter
-    behavior: instant "yes, it's downloading" feedback, which is what
-    DownloadProgress wants (throttle_progress.sh's show_pending_if_due()
-    is the same bypass on the bash side).
+    By default the first `due()` MUST wait out a full interval, so a step
+    that finishes sooner stays silent (docs/ARCHITECTURE.md, "Worker
+    logging"). `fire_immediately=True` makes the first call due instead, for
+    curl's progress-meter behavior: instant "yes, it's downloading"
+    feedback. throttle_progress.sh's show_pending_if_due() is the same
+    bypass in bash.
     """
 
     def __init__(self, interval, fire_immediately=False):

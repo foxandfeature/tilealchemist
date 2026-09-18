@@ -1,26 +1,25 @@
 name: TileAlchemist pipeline (reusable)
 
-# Builds one or more profiles' world-covering PMTiles layers: prepare-shards
-# walks the source archive once, build-shards runs every profile's per-tile
-# transform against the same fetched bytes across `worker_count` parallel
-# workers, merge joins each profile's own shards into its own .pmtiles file.
+# Builds one or more profiles' world-covering PMTiles layers. prepare-shards
+# walks the source archive once. build-shards runs every profile's per-tile
+# transform against the same fetched bytes, across `worker_count` parallel
+# workers. merge joins each profile's shards into its own .pmtiles file.
 #
-# Deliberately publishes nowhere (no GitHub Release, no B2 upload): that's
-# the calling workflow's job. Every caller is a separate repository (see
-# foxandfeature/tilealchemist-standardprofiles for a real one) calling this via
+# This workflow MUST publish nowhere: no GitHub Release, no B2 upload. That
+# is the calling workflow's job. Every caller is a separate repository (see
+# foxandfeature/tilealchemist-standardprofiles) calling this via
 # `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
 #
-# Profiles arrive as an artifact the caller uploads before calling, never
-# from a checkout done here: this pipeline has no opinion about which
-# repository a profile lives in, or whether it was committed to one at all.
-# See docs/ARCHITECTURE.md "Getting the profiles in".
+# Profiles arrive as an artifact the caller uploads, never from a checkout
+# done here. This pipeline has no opinion about which repository a profile
+# lives in, or whether it was committed to one at all. See
+# docs/ARCHITECTURE.md "Getting the profiles in".
 #
-# See docs/ARCHITECTURE.md "Publishing" for the rest of the reusable-workflow
+# docs/ARCHITECTURE.md "Publishing" has the rest of the reusable-workflow
 # contract: the `<output_basename>-pmtiles` artifact-name interface, why
 # nothing is published from here, and why every job below checks out
-# tilealchemist by name instead of finding it in the workspace. Also
-# "Fetching"/"Parallelism" for why one fetch per worker covers every
-# profile.
+# tilealchemist by name instead of finding it in the workspace.
+# "Fetching"/"Parallelism" say why one fetch per worker covers every profile.
 
 on:
   workflow_call:
@@ -95,9 +94,9 @@ jobs:
           fi
 
       # Both are empty on GitHub Enterprise Server, where an empty `ref`
-      # would silently check the default branch out instead. Asserted here,
-      # in the run's first job, rather than in all three; see
-      # docs/ARCHITECTURE.md "Getting the profiles in".
+      # would silently check the default branch out instead. Asserted in the
+      # run's first job rather than in all three; see docs/ARCHITECTURE.md
+      # "Getting the profiles in".
       - name: Validate the tilealchemist checkout resolves
         env:
           TILEALCHEMIST_REPOSITORY: ${{ job.workflow_repository }}
@@ -109,10 +108,10 @@ jobs:
           fi
           echo "tilealchemist: ${TILEALCHEMIST_REPOSITORY}@${TILEALCHEMIST_SHA}"
 
-      # This job runs no profile; it downloads them only so a path that
-      # isn't in the artifact fails here, in seconds, instead of identically
-      # in every one of `worker_count` build-shards cells after the archive
-      # walk has already run.
+      # This job runs no profile. It downloads them only so a path missing
+      # from the artifact fails here, in seconds, instead of identically in
+      # every one of `worker_count` build-shards cells after the archive walk
+      # has already run.
       - name: Download the caller's profiles
         uses: actions/download-artifact@v4
         with:
@@ -132,7 +131,7 @@ jobs:
             fi
           done
 
-      # tilealchemist alone: no caller repository is ever checked out here.
+      # tilealchemist alone. No caller repository is ever checked out here.
       - uses: actions/checkout@v4
         with:
           repository: ${{ job.workflow_repository }}
@@ -202,11 +201,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tilealchemist
 
-      # The only job that needs a profile at all, and it takes it from the
-      # caller's artifact rather than checking the caller's repository out:
-      # that way a profile can come from anywhere the calling workflow can
-      # produce a file. Unpacked at the workspace root so the paths in
-      # `profile` read the same as a repo-relative path would.
+      # The only job that needs a profile. It takes it from the caller's
+      # artifact rather than checking the caller's repository out, so a
+      # profile can come from anywhere the calling workflow can produce a
+      # file. Unpacked at the workspace root, so the paths in `profile` read
+      # the same as a repo-relative path would.
       - name: Download the caller's profiles
         uses: actions/download-artifact@v4
         with:
@@ -217,9 +216,9 @@ jobs:
           python-version: "3.11"
 
       # A profile's own dependencies come from the PEP 723 block inside its
-      # own .py file, read without importing it, since importing would need
-      # those very dependencies first. See docs/PROFILES.md ("Writing and
-      # distributing your own profile") and profile_requirements.py.
+      # .py file, read without importing it: importing would need those very
+      # dependencies first. See docs/PROFILES.md ("Writing and distributing
+      # your own profile") and profile_requirements.py.
       - name: Install tilealchemist and every profile's own dependencies
         env:
           PROFILE: ${{ inputs.profile }}
@@ -260,9 +259,9 @@ jobs:
             --source manifests/source.json \
             --out "$OUT_JOINED"
 
-      # A missing file is expected, not a failure, and one artifact per
-      # worker can't collide across profiles; see docs/ARCHITECTURE.md
-      # "Worker independence".
+      # A missing file is expected, not a failure. One artifact per worker
+      # cannot collide across profiles; see docs/ARCHITECTURE.md "Worker
+      # independence".
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -286,7 +285,7 @@ jobs:
           path: .tilealchemist
 
       # Every cell downloads every profile's shards and uses only its own,
-      # by the filename prefix below; see docs/ARCHITECTURE.md "Publishing".
+      # by the filename prefix below. See docs/ARCHITECTURE.md "Publishing".
       - name: Download all shard artifacts
         uses: actions/download-artifact@v4
         with:
@@ -303,9 +302,9 @@ jobs:
             sudo make -C /tmp/tippecanoe install
           }
 
-      # tile-join rewrites a `z/x/y` progress line in place with \r;
-      # throttled for the same reason as the worker logs (see README), while
-      # warnings and errors pass straight through.
+      # tile-join rewrites a `z/x/y` progress line in place with \r.
+      # Throttled for the same reason as the worker logs (see README).
+      # Warnings and errors pass straight through.
       - name: Merge this profile's shards into its final layer
         env:
           ATTRIBUTION: ${{ inputs.attribution }}

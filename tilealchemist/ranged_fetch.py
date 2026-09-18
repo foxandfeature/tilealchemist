@@ -1,11 +1,11 @@
-"""HTTP Range fetching against the source PMTiles archive, shared by the
-only two things that ever talk to it: `pmtiles_index.py` (one request for
-the header, one for the whole directory index, both on the prepare-shards
-side) and `fetch_batching.py` (one request for a worker's whole batch of
-tile data).
+"""HTTP Range fetching against the source PMTiles archive.
 
-The two call sites differ only in what their progress line says and in
-how retry warnings name them, so those are parameters:
+Shared by the only two things that talk to it: `pmtiles_index.py` (header
+and directory index, on the prepare-shards side) and `fetch_batching.py` (a
+worker's batch of tile data).
+
+The two call sites differ only in what their progress line says and how
+retry warnings name them, so those are parameters:
 `DownloadProgress(label=...)` and `retry_label`.
 """
 import sys
@@ -16,13 +16,12 @@ import requests
 from tilealchemist.backoff import backoff_delay
 from tilealchemist.throttle import UpdateLineThrottle
 
-# Retries cover the transient ways the CDN fails under many concurrent
-# workers hitting a freshly-published archive at once (cold-cache
-# stampede): a full 200 instead of a 206 (server ignored the Range header,
-# and reading the response in full would be tens of GB), a 429/5xx
-# (rate-limiting or buckling under the burst), or the connection dropping
-# mid-stream on a large transfer. None is a permanent failure, so all are
-# worth a few backed-off retries before giving up.
+# Retries cover the transient ways the CDN fails under a cold-cache
+# stampede, many concurrent workers hitting a freshly-published archive at
+# once. Three shapes: a 200 instead of a 206 (the server ignored the Range
+# header, and reading the response in full would be tens of GB), a 429/5xx
+# (rate-limiting, or buckling under the burst), and the connection dropping
+# mid-stream. None is permanent, so all are worth a few backed-off retries.
 MAX_RANGE_ATTEMPTS = 6
 RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -45,8 +44,8 @@ class DownloadProgress:
     nothing here needs to be thread-safe.
 
     `update` takes the bytes received so far in the current attempt, not a
-    delta, so a retry that restarts the transfer rewinds the line instead of
-    counting the re-sent bytes a second time and running past 100%.
+    delta. A retry that restarts the transfer then rewinds the line, instead
+    of counting the re-sent bytes twice and running past 100%.
     """
 
     def __init__(self, total_bytes, interval, label):
@@ -64,10 +63,12 @@ class DownloadProgress:
 
 
 class _RetryableFailure(Exception):
-    """One attempt failed in a way worth another try. `detail` names it in the
-    retry warning, `response` carries a Retry-After header (None when the
-    connection broke and there is no response left to read one from), and
-    `final` is raised in its place once the attempts run out."""
+    """One attempt failed in a way worth another try.
+
+    `detail` names it in the retry warning. `response` may carry a
+    Retry-After header, and is None when the connection broke with no
+    response left to read one from. `final` is raised in its place once the
+    attempts run out."""
 
     def __init__(self, detail, response, final):
         super().__init__(detail)
@@ -78,9 +79,10 @@ class _RetryableFailure(Exception):
 
 def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size):
     """The response body for `range_header`, or `_RetryableFailure` for the
-    transient ways this fails. Leaving the `with` while that propagates closes
-    the response, so the connection is back in the pool before the caller's
-    backoff sleeps on it."""
+    transient ways this fails.
+
+    Leaving the `with` while that propagates closes the response, so the
+    connection is back in the pool before the caller's backoff sleeps."""
     with session.get(url, headers={"Range": range_header}, timeout=READ_TIMEOUT,
                      stream=True) as response:
         status = response.status_code
@@ -115,7 +117,7 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size):
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError) as error:
             # Seen as an IncompleteRead well past the halfway point on a
-            # large batch. The connection already broke, so there is no
+            # large batch. The connection is already gone, so there is no
             # Retry-After to honour and the backoff runs on jitter alone.
             raise _RetryableFailure(
                 f"connection dropped after {downloaded} bytes "
@@ -124,7 +126,7 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size):
 
 def _warn_retry(retry_label, detail, attempt, delay):
     """A workflow command emitted as the retry happens, so a cold-cache
-    stampede surfaces in the Actions UI instead of only in the job log.
+    stampede surfaces in the Actions UI and not only in the job log.
     `retry_label` names the call site that hit it."""
     print(f"::warning title={retry_label} retry::{detail} "
           f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s",

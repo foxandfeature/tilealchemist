@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""The whole run's one-time planning step, before any shard worker starts:
-walks a source PMTiles archive's directory tree once and partitions the
-resulting entries (plus computed gaps) into `--worker-count` contiguous
-manifests, one per worker. See README.md ("Fetching") for why it's
-structured this way, and tilealchemist/sources/ for how the archive URL
-itself gets resolved.
+"""The whole run's one-time planning step, before any shard worker starts.
+
+Walks a source PMTiles archive's directory tree once and partitions the
+resulting entries, plus computed gaps, into `--worker-count` contiguous
+manifests, one per worker. README.md ("Fetching") says why it is structured
+this way; tilealchemist/sources/ resolves the archive URL.
 
 This file is the entry point only: argument parsing, then handing off. The
-actual run (what runs, in what order, and what gets printed) lives in
-`tilealchemist/shard_prep.py` (see its docstring for the phase-by-phase
-flow); the two halves that drives are `tilealchemist/pmtiles_index.py` (a
-URL -> every directory entry in the zoom range) and `tilealchemist/partition.py`
-(those entries -> one block of work per worker), with `tilealchemist/manifest.py`
-writing the blocks out in the form build_shard.py reads back.
+run itself lives in `tilealchemist/shard_prep.py`, whose docstring has the
+phase-by-phase flow. The two halves it drives are
+`tilealchemist/pmtiles_index.py` (a URL -> every directory entry in the zoom
+range) and `tilealchemist/partition.py` (those entries -> one block of work
+per worker). `tilealchemist/manifest.py` writes the blocks out in the form
+build_shard.py reads back.
 
     tilealchemist-prepare-shards --worker-count 128 --min-zoom 0 --max-zoom 14 \
         --out-dir manifests/
@@ -26,9 +26,9 @@ from tilealchemist.zoom import MAX_SUPPORTED_ZOOM, ZoomLevel
 
 
 def zoom_level_type(value):
-    """argparse type shared by --min-zoom and --max-zoom: both accept exactly
-    the same levels, so they get exactly one validator, and both come out of
-    it as the `ZoomLevel` member everything downstream passes around."""
+    """argparse type shared by --min-zoom and --max-zoom. Both accept the
+    same levels, so they share one validator, and both come out of it as the
+    `ZoomLevel` member everything downstream passes around."""
     zoom = int(value)  # a non-numeric value is argparse's own error to report
     try:
         return ZoomLevel(zoom)
@@ -39,7 +39,7 @@ def zoom_level_type(value):
 
 def schema_type(value):
     """argparse type for --schema: the `SchemaName` member this name stands
-    for, so everything downstream of parse_args() handles the enum and not a
+    for. Everything downstream of parse_args() then handles the enum, not a
     string that may or may not be one of ours."""
     try:
         return SchemaName(value)
@@ -68,8 +68,8 @@ def parse_args():
     if args.min_zoom > args.max_zoom:
         parser.error(f"--min-zoom ({args.min_zoom}) must not exceed --max-zoom ({args.max_zoom})")
     # Built here only to turn a bad --source/--source-url/--schema combination
-    # into a usage error instead of a traceback out of the run; run_prepare()
-    # builds the one it actually resolves. Costs nothing, touching no network.
+    # into a usage error instead of a traceback out of the run. run_prepare()
+    # builds the one it resolves. Touches no network.
     try:
         resolve_source(args.source, args.source_url, args.schema)
     except ValueError as error:

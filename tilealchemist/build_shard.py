@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""One worker's shard of a profile's output layer (see docs/ARCHITECTURE.md's
-"Fetching" and "Parallelism" sections for what this does and why; see
-docs/PROFILES.md for what a --profile actually computes per tile).
+"""One worker's shard of a profile's output layer.
+
+docs/ARCHITECTURE.md "Fetching" and "Parallelism" say what this does and
+why; docs/PROFILES.md says what a --profile computes per tile.
 
 This file is the entry point only: argument parsing, then handing off. The
-actual worker run (what runs, in what order, and what gets printed) lives
-in `tilealchemist/shard_worker.py` (see its docstring for the phase-by-phase
-flow); the two halves that drives are `tilealchemist/transform.py` (fetched
-bytes -> each profile's output tiles) and `tilealchemist/mbtiles.py` (those
-tiles -> one shard file per profile).
+worker run itself lives in `tilealchemist/shard_worker.py`, whose docstring
+has the phase-by-phase flow. The two halves it drives are
+`tilealchemist/transform.py` (fetched bytes -> each profile's output tiles)
+and `tilealchemist/mbtiles.py` (those tiles -> one shard file per profile).
 
-Logging to stderr is two kinds of line: major ones (phase transitions and
-the final summary) that always print, and throttled `update: ...` ones that
-exist only so a step taking a while doesn't look stuck. See
-docs/ARCHITECTURE.md's "Worker logging" for both, and --report-interval /
---download-report-interval below for the intervals.
+Logging to stderr is two kinds of line. Major ones, phase transitions and
+the final summary, always print. Throttled `update: ...` ones exist only so
+a step taking a while does not look stuck. See docs/ARCHITECTURE.md "Worker
+logging" for both, and --report-interval / --download-report-interval below
+for the intervals.
 
     tilealchemist-build-shard --worker-index 0 --profile ./my_profile.py \
         --manifest manifests/worker-000.bin --source manifests/source.json \
@@ -34,9 +34,9 @@ from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
 
 
-# Default for --download-report-interval: its own flag, and shorter than the
-# transform's, because the download phase it covers is itself shorter (see
-# docs/ARCHITECTURE.md "Worker logging").
+# Default for --download-report-interval. Its own flag, and shorter than the
+# transform's, because the download phase it covers is itself shorter. See
+# docs/ARCHITECTURE.md "Worker logging".
 DEFAULT_DOWNLOAD_REPORT_INTERVAL = 15.0
 
 

@@ -14,8 +14,8 @@ def _server_requested_delay(response):
 
 
 def _jittered_backoff(attempt, base_delay):
-    # Jittered so many concurrently-running workers throttled in the same
-    # burst don't retry in lockstep and immediately reproduce the same burst.
+    # Jitter breaks lockstep. Workers throttled in the same burst would
+    # otherwise retry together and reproduce it.
     return base_delay * (2 ** (attempt - 1)) * random.uniform(1.0, 1.5)
 
 

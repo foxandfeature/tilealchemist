@@ -1,10 +1,10 @@
 """One run's directory entries -> one block of work per worker.
 
-Pure bookkeeping over the `Entry` records `pmtiles_index.py` produced (plus
-the gap records computed here): no network, no files, no CLI.
-`prepare_shards.py` calls this and writes each block out with
-`manifest.py`. See docs/ARCHITECTURE.md's "Fetching" section for why real
-entries are split contiguously in offset order, and why gaps exist at all.
+Pure bookkeeping over the `Entry` records `pmtiles_index.py` produced, plus
+the gap records computed here. No network, no files, no CLI.
+`prepare_shards.py` calls this and writes each block out with `manifest.py`.
+docs/ARCHITECTURE.md "Fetching" says why real entries are split contiguously
+in offset order, and why gaps exist at all.
 
     compute_gaps()                   tile_ids no entry covers at all
       _chunk_gap()                   ... capped at GAP_CHUNK_SIZE tiles each
@@ -21,17 +21,18 @@ from tilealchemist.manifest import Entry
 from tilealchemist.pmtiles_index import tile_id_bounds
 
 # Gaps (see compute_gaps()) are chunked to at most this many tiles per
-# manifest record so a single huge unbroken gap (e.g. a whole ice sheet's
-# interior) doesn't land entirely on one worker.
+# manifest record. A single huge unbroken gap — a whole ice sheet's
+# interior — MUST NOT land entirely on one worker.
 GAP_CHUNK_SIZE = 200_000
 
 
 def compute_gaps(entries, min_zoom, max_zoom):
     """Gaps in the min_zoom..max_zoom tile-ID range that no entry covers
-    (see docs/ARCHITECTURE.md "Fetching"). Directory entries never overlap
-    in tile_id space, so once they're sorted by tile_id their ends are
-    non-decreasing too, which is why `expected` can just be overwritten
-    each iteration instead of tracked as a running max."""
+    (docs/ARCHITECTURE.md "Fetching").
+
+    Directory entries never overlap in tile_id space. Sorted by tile_id,
+    their ends are non-decreasing too, so `expected` can be overwritten each
+    iteration rather than tracked as a running max."""
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     gaps = []
     expected = tile_id_start
@@ -46,7 +47,7 @@ def compute_gaps(entries, min_zoom, max_zoom):
 
 def _chunk_gap(start, end):
     """The [start, end) tile-ID gap as records of at most GAP_CHUNK_SIZE
-    tiles each, tagged length=0, the sentinel shard_worker.py's
+    tiles each. length=0 is the sentinel shard_worker.py's
     split_manifest_entries() tells a gap by, there being nothing to fetch."""
     return [Entry(tile_id=chunk_start, offset=0, length=0,
                   run_length=min(GAP_CHUNK_SIZE, end - chunk_start))
@@ -58,24 +59,25 @@ def _share_end(record_count, worker_index, worker_count):
     `record_count` of them are split as evenly as possible across
     `worker_count` workers.
 
-    Multiplying before dividing is what makes it "as evenly as possible":
-    a remainder that doesn't divide out goes to single workers spaced
-    across the whole range, one record each (13 records over 5 workers ->
-    2,3,2,3,3), rather than piling onto one (-> 2,2,2,2,5). No block ends
-    up more than one record bigger than another."""
+    Multiplying before dividing is what makes it "as evenly as possible".
+    A remainder that does not divide out goes to single workers spaced across
+    the range, one record each (13 records over 5 workers -> 2,3,2,3,3),
+    rather than piling onto one (-> 2,2,2,2,5). No block ends up more than
+    one record bigger than another."""
     return record_count * (worker_index + 1) // worker_count
 
 
 def partition_evenly(records, worker_count, atomic_key=None):
     """Splits `records` into `worker_count` blocks of about
-    record_count/worker_count *records* each, record count being the unit
-    that tracks decode cost, unlike bytes or output tiles, which both
-    failed in production (docs/ARCHITECTURE.md, "Parallelism").
+    record_count/worker_count *records* each.
 
-    `atomic_key` names what must not be cut in two. Real entries pass
+    Record count is the unit that tracks decode cost. Bytes and output tiles
+    both failed in production (docs/ARCHITECTURE.md, "Parallelism").
+
+    `atomic_key` names what MUST NOT be cut in two. Real entries pass
     `offset`, keeping a same-offset run whole even past a worker's target
-    size (hence "about"); gaps pass nothing and are cut exactly, their
-    shared sentinel offset=0 being no reason to land in one block."""
+    size (hence "about"). Gaps pass nothing and are cut exactly: their shared
+    sentinel offset=0 is no reason to land in one block."""
     if atomic_key is None:
         groups = [[record] for record in records]
     else:
@@ -95,9 +97,10 @@ def partition_evenly(records, worker_count, atomic_key=None):
 
 def partition_into_worker_blocks(entries, gaps, worker_count):
     """Each worker's full share: its contiguous slice of real entries plus
-    its even slice of gap records. Partitioned in two passes because the two
-    kinds of record are cut differently (see partition_evenly()'s
-    `atomic_key`) but are written to one manifest per worker."""
+    its even slice of gap records.
+
+    Two passes, because the two kinds of record are cut differently (see
+    partition_evenly()'s `atomic_key`) but go to one manifest per worker."""
     real_blocks = partition_evenly(entries, worker_count,
                                    atomic_key=operator.attrgetter("offset"))
     gap_blocks = partition_evenly(gaps, worker_count)
