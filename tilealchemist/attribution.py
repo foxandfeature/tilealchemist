@@ -7,6 +7,9 @@ repository ships do not state the same one:
     OpenFreeMap  OpenFreeMap, &copy; OpenMapTiles, &copy; OpenStreetMap contributors
     Protomaps    &copy; OpenStreetMap
 
+(anchors in the archives, flattened here; nothing strips them, so a template
+composes with the markup intact)
+
 A caller shapes that into the layer's own attribution with the pipeline's
 `attribution` input, a template in which `{source}` stands for what the
 archive declared. Whoever runs the pipeline owns this, not the profile: a
