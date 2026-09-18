@@ -58,7 +58,8 @@ jobs:
       # expensive.
       max_zoom: "4"
       worker_count: "1"
-      attribution: "CI test run, not for real use"
+      # No `attribution:`: this call covers the inherited path, where each
+      # layer carries what its source archive declares for itself.
 
   # The same world and zoom range, read through the other source and schema.
   # Proves ProtomapsSource picks a build out of the daily index, and that
@@ -88,6 +89,7 @@ jobs:
       # Namespacing this one is enough: the other's `shards-*` does not reach
       # into `protomaps-shards-*` (see _pipeline.yml's `artifact_namespace`).
       artifact_namespace: "protomaps"
+      # Covers the other path: the input replacing the archive's own.
       attribution: "CI test run, not for real use"
 
   # A run that writes nothing still exits 0, so the pipeline succeeding above

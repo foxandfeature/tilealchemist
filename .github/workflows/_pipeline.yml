@@ -70,9 +70,10 @@ on:
         required: true
         type: string
       attribution:
-        description: "HTML attribution string embedded in every profile's merged PMTiles metadata via tile-join --attribution."
-        required: true
+        description: "What the built layers credit, as a template in which \"{source}\" stands for the attribution the source archive declares for itself, e.g. \"<a href=\\\"https://example.org\\\">&copy; Example</a> {source}\". Left off, the archive's own attribution is carried through unchanged; given without the placeholder, it replaces it outright. See docs/ARCHITECTURE.md \"Source attribution\"."
+        required: false
         type: string
+        default: ""
 
 jobs:
   prepare-shards:
@@ -80,6 +81,7 @@ jobs:
     outputs:
       workers: ${{ steps.gen-workers.outputs.workers }}
       profile_pairs: ${{ steps.gen-pairs.outputs.profile_pairs }}
+      attribution: ${{ steps.walk.outputs.attribution }}
     steps:
       - name: Validate profile/output_basename line up 1:1
         env:
@@ -145,7 +147,8 @@ jobs:
       - name: Install tilealchemist
         run: pip install ./.tilealchemist
 
-      - name: Walk archive directory and partition into per-worker manifests
+      - id: walk
+        name: Walk archive directory and partition into per-worker manifests
         env:
           MIN_ZOOM: ${{ inputs.min_zoom }}
           MAX_ZOOM: ${{ inputs.max_zoom }}
@@ -153,6 +156,7 @@ jobs:
           SOURCE_URL: ${{ inputs.source_url }}
           SCHEMA: ${{ inputs.schema }}
           WORKER_COUNT: ${{ inputs.worker_count }}
+          ATTRIBUTION: ${{ inputs.attribution }}
         run: |
           ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
           if [ -n "$SOURCE_URL" ]; then
@@ -161,7 +165,17 @@ jobs:
           if [ -n "$SCHEMA" ]; then
             ARGS+=(--schema "$SCHEMA")
           fi
-          tilealchemist-prepare-shards "${ARGS[@]}"
+          if [ -n "$ATTRIBUTION" ]; then
+            ARGS+=(--attribution "$ATTRIBUTION")
+          fi
+          # stdout is the layer attribution the merge job stamps in; the run's
+          # log lines go to stderr and pass straight through. The template is
+          # filled in there rather than here because `${v//p/r}` expands an
+          # unescaped `&` in the replacement to the match, and both sources'
+          # attributions are full of `&copy;`.
+          LAYER_ATTRIBUTION=$(tilealchemist-prepare-shards "${ARGS[@]}")
+          echo "attribution=$LAYER_ATTRIBUTION" >> "$GITHUB_OUTPUT"
+          echo "$LAYER_ATTRIBUTION"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -307,9 +321,13 @@ jobs:
       # Warnings and errors pass straight through.
       - name: Merge this profile's shards into its final layer
         env:
-          ATTRIBUTION: ${{ inputs.attribution }}
+          ATTRIBUTION: ${{ needs.prepare-shards.outputs.attribution }}
           OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
         run: |
+          if [ -z "$ATTRIBUTION" ]; then
+            echo "::error::no attribution for ${OUTPUT_BASENAME}; a layer MUST NOT be published without one"
+            exit 1
+          fi
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
             -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \

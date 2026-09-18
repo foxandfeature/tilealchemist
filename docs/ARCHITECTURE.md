@@ -57,6 +57,57 @@ what Protomaps asks for if a *deployed* map is what would be reading it
 whose URLs can move); one archive walk per build run is the download that
 page describes, not the serving it warns about.
 
+## Source attribution
+
+What a layer credits is a statement about the data it was built from, so the
+pipeline reads it off the archive that was walked rather than taking the
+caller's word for it. PMTiles v3 keeps a JSON metadata document between the
+root directory and the tile data (spec section 4), and both sources this
+repository ships state an `attribution` in it. They do not state the same one:
+
+    OpenFreeMap   OpenFreeMap, &copy; OpenMapTiles, &copy; OpenStreetMap contributors
+    Protomaps     &copy; OpenStreetMap
+
+(anchors in the archives, flattened here). A constant in a workflow file
+cannot follow that difference. Switching `source` leaves the old string in
+place and nothing in the run disagrees: the layer publishes, crediting a
+provider whose bytes it never read.
+
+`attribution.py` reads it during `prepare-shards`, for one ranged request of
+about a kilobyte. The metadata lies outside the 16 KB prefix
+`pmtiles_index.py` already holds — OpenFreeMap writes it just past that
+boundary, Protomaps at the end of a 137 GB archive — so it is cheap rather
+than free.
+
+What the run makes of it is the caller's business. The `attribution` input is
+a template in which `{source}` stands for what the archive declared:
+
+| `attribution` | the layer credits |
+| --- | --- |
+| unset | the archive's own attribution, unchanged |
+| `<a ...>&copy; Example</a> {source}` | the caller's name, then the archive's |
+| `&copy; Example` | that, instead of the archive's |
+
+This belongs to whoever runs the pipeline rather than to the profile. A
+profile can be a file downloaded from anywhere, and editing it to add a name
+is not something a caller should have to do; the credit is a property of the
+run, not of the transform. It is also why one answer serves every profile in a
+run: `prepare-shards` resolves the source, walks it and reads its metadata
+without importing caller code at all.
+
+The substitution happens in `compose_attribution()`, not in the workflow's
+shell, and that is load-bearing: bash's `${v//p/r}` expands an unescaped `&`
+in the replacement to the matched text, and both sources' attributions are
+full of `&copy;`, so composing there would corrupt exactly the strings this
+exists to carry.
+
+An empty attribution is refused rather than published. An archive declaring
+none with no template to stand in for it, a template whose `{source}` has
+nothing to fill it with, and a template that composes to nothing all fail the
+run inside `prepare-shards`, before a worker is dispatched. `merge` asserts
+the value once more before `tile-join` stamps it, the value having crossed a
+job output in between.
+
 ## Fetching: directory-driven, not one request per tile
 
 A naive implementation would issue one HTTP range request per tile: at
@@ -306,9 +357,10 @@ coordination, shared state, and a failure mode, and buy nothing.
 
 `.github/workflows/_pipeline.yml` is a **reusable** workflow
 (`on: workflow_call`) containing only `prepare-shards` → `build-shards` →
-`merge`, parameterized by `profile`, `profile_artifact`, `source`,
-`output_basename`, and `attribution` (plus `schema`, which only a
-`static-url` source needs; see "Source resolution"). `profile`/`output_basename` each take
+`merge`, parameterized by `profile`, `profile_artifact`, `source`, and
+`output_basename` (plus `schema`, which only a `static-url` source needs, and
+the optional `attribution` template; see "Source resolution" and "Source
+attribution"). `profile`/`output_basename` each take
 one value (e.g. `profile: ./land.py`) or a comma-separated list
 matched 1:1 (e.g. `output_basename: land,cropped-waterways`), so
 `prepare-shards` and each worker's fetch happen once per run regardless of

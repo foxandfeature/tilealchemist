@@ -14,6 +14,9 @@ range) and `tilealchemist/partition.py` (those entries -> one block of work
 per worker). `tilealchemist/manifest.py` writes the blocks out in the form
 build_shard.py reads back.
 
+Prints the layer's attribution on stdout; every log line goes to stderr. See
+attribution.py.
+
     tilealchemist-prepare-shards --worker-count 128 --min-zoom 0 --max-zoom 14 \
         --out-dir manifests/
 """
@@ -55,6 +58,11 @@ def parse_args():
     parser.add_argument("--min-zoom", type=zoom_level_type, default=ZoomLevel.Z0)
     parser.add_argument("--max-zoom", type=zoom_level_type, default=ZoomLevel.Z14)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--attribution", default=None,
+                         help="what the built layer credits, as a template in which "
+                              "`{source}` stands for the attribution the archive declares "
+                              "for itself; left off, the archive's own is carried through "
+                              "unchanged")
     parser.add_argument("--source", choices=sorted(SOURCES), default="openfreemap",
                          help="where to resolve the PMTiles archive from (default openfreemap)")
     parser.add_argument("--source-url", default=None,

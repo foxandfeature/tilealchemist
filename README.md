@@ -83,6 +83,7 @@ else.
 | `pyproject.toml` | Packaging: dependencies and console scripts. A profile needing anything beyond these declares it inline, in a PEP 723 block in its own `.py` file. |
 | `tilealchemist/prepare_shards.py` | The run's entry point: parses its flags, then hands off to `shard_prep.py`. |
 | `tilealchemist/shard_prep.py` | The run's one-time planning step: resolves the `Source`, drives the walk and the partition, writes the manifests, logs the run. Needs a `Source`, not a `Profile`. |
+| `tilealchemist/attribution.py` | What a built layer credits: reads the attribution the source archive declares for itself, and fills the caller's `{source}` template in with it. |
 | `tilealchemist/pmtiles_index.py` | The source archive's directory index: header + root, then only the leaf directories the zoom range needs, in two range requests, walked and zoom-pruned in memory into directory entries. |
 | `tilealchemist/partition.py` | Those entries (plus the gaps between them) into one balanced, contiguous block of work per worker. No network, no files. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |
@@ -140,6 +141,11 @@ additionally carries public-domain Natural Earth data and, in its
 if a profile ever read that layer (none here does). Each layer carries
 its attribution in its own PMTiles metadata, so a style reading it through
 the [PMTiles protocol](https://github.com/protomaps/PMTiles) picks it up
-automatically; see
+automatically. That string is not typed out in full in a workflow file: the
+pipeline reads what the source archive declares and fills it into the
+`attribution` template, so a run credits the provider whose bytes it actually
+read. A run that cannot state what its output credits fails instead of
+publishing an unattributed layer (see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Source attribution"). See
 [tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)
 for the layers built from this pipeline today.

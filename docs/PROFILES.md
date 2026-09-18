@@ -613,7 +613,6 @@ jobs:
       profile: ./my_profile.py
       profile_artifact: my-profiles
       output_basename: my-profile
-      attribution: "..."
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -622,6 +621,14 @@ jobs:
         with: { name: my-profile-pmtiles }
       - run: ./publish-wherever-you-want.sh
 ```
+
+No `attribution` there, and often none anywhere: left off, the layer carries
+what the source archive declares for itself. It is a template, so
+`attribution: '<a href="https://example.org">&copy; Example</a> {source}'`
+puts your own name in front of that, and a value without `{source}` replaces
+it outright. It is an input rather than something a profile decides, because
+the profile can be somebody else's file while the credit belongs to your run;
+see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) "Source attribution".
 
 `_pipeline.yml` only builds and hands you the merged `.pmtiles` as an
 artifact; publishing it anywhere (a GitHub Release, B2, elsewhere) is left
