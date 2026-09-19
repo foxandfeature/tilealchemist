@@ -15,7 +15,7 @@ distinction. See [`docs/PROFILES.md`](docs/PROFILES.md) to write one.
 
 For two real ones, plus the finished world-covering PMTiles layers they
 produce and a MapLibre style for each, see
-**[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)**:
+**[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)**:
 
 | Profile | Produces |
 | --- | --- |
@@ -79,7 +79,7 @@ else.
 | --- | --- |
 | `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel, merges into one `.pmtiles` artifact per profile. Never publishes. Safe to call cross-repo. |
 | `.github/workflows/_publish-release.yml` | Reusable: publishes a merged `.pmtiles` artifact as a GitHub Release. Safe to call cross-repo. |
-| `.github/workflows/test.yml` | CI: real low-zoom runs against live OpenFreeMap *and* Protomaps data, built with [tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)' profiles, on every push and PR. |
+| `.github/workflows/test.yml` | CI: real low-zoom runs against live OpenFreeMap *and* Protomaps data, built with [tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)' profiles, on every push and PR. |
 | `pyproject.toml` | Packaging: dependencies and console scripts. A profile needing anything beyond these declares it inline, in a PEP 723 block in its own `.py` file. |
 | `tilealchemist/prepare_shards.py` | The run's entry point: parses its flags, then hands off to `shard_prep.py`. |
 | `tilealchemist/shard_prep.py` | The run's one-time planning step: resolves the `Source`, drives the walk and the partition, writes the manifests, logs the run. Needs a `Source`, not a `Profile`. |
@@ -107,7 +107,7 @@ else.
 
 ## Related projects
 
-- **[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)**
+- **[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)**
   holds the `land` and `cropped-waterways` profiles, the workflow that
   builds and publishes them monthly, and the finished PMTiles layers. It is
   a consumer of this project, and the reference for how to call
@@ -158,5 +158,5 @@ pipeline reads what the source archive declares and fills it into the
 read. A run that cannot state what its output credits fails instead of
 publishing an unattributed layer (see
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Source attribution"). See
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)
 for the layers built from this pipeline today.

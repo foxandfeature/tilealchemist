@@ -2,6 +2,7 @@
 import itertools
 import operator
 
+from tilealchemist.cost import cost_weights
 from tilealchemist.manifest import Entry
 from tilealchemist.pmtiles_index import tile_id_bounds
 
@@ -30,44 +31,47 @@ def _chunk_gap(start, end):
             for chunk_start in range(start, end, GAP_CHUNK_SIZE)]
 
 
-def _share_end(record_count, worker_index, worker_count):
-    return record_count * (worker_index + 1) // worker_count
+def _share_end(total_weight, worker_index, worker_count):
+    return total_weight * (worker_index + 1) / worker_count
 
 
-def _even_share(record_count, worker_count):
-    return max(1, -(-record_count // worker_count))
-
-
-def _atomic_groups(records, atomic_key, share_limit):
+def _atomic_groups(weighted_records, atomic_key, share_limit):
     if atomic_key is None:
-        for record in records:
-            yield [record]
+        for record, weight in weighted_records:
+            yield [record], weight
         return
-    for _key, group in itertools.groupby(records, key=atomic_key):
-        run = list(group)
-        for start in range(0, len(run), share_limit):
-            yield run[start:start + share_limit]
+    for _key, group in itertools.groupby(weighted_records,
+                                          key=lambda pair: atomic_key(pair[0])):
+        run, run_weight = [], 0.0
+        for record, weight in group:
+            if run and run_weight + weight > share_limit:
+                yield run, run_weight
+                run, run_weight = [], 0.0
+            run.append(record)
+            run_weight += weight
+        yield run, run_weight
 
 
-def partition_evenly(records, worker_count, atomic_key=None):
-    record_count = len(records)
-    groups = _atomic_groups(records, atomic_key, _even_share(record_count, worker_count))
+def partition_by_cost(records, worker_count, atomic_key=None):
+    weights, total_weight = cost_weights(records)
+    groups = _atomic_groups(zip(records, weights), atomic_key,
+                             total_weight / worker_count)
     blocks = [[] for _ in range(worker_count)]
     worker_index = 0
-    assigned_count = 0
-    for group in groups:
+    assigned_weight = 0.0
+    for group, group_weight in groups:
         blocks[worker_index].extend(group)
-        assigned_count += len(group)
+        assigned_weight += group_weight
         # A group can span several shares, and every one it covered must be skipped.
         while (worker_index < worker_count - 1
-               and assigned_count >= _share_end(record_count, worker_index, worker_count)):
+               and assigned_weight >= _share_end(total_weight, worker_index, worker_count)):
             worker_index += 1
     return blocks
 
 
 def partition_into_worker_blocks(entries, gaps, worker_count):
-    real_blocks = partition_evenly(entries, worker_count,
-                                   atomic_key=operator.attrgetter("offset"))
-    gap_blocks = partition_evenly(gaps, worker_count)
+    real_blocks = partition_by_cost(entries, worker_count,
+                                    atomic_key=operator.attrgetter("offset"))
+    gap_blocks = partition_by_cost(gaps, worker_count)
     return [real_block + gap_block
             for real_block, gap_block in zip(real_blocks, gap_blocks)]

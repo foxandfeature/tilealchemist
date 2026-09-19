@@ -5,7 +5,7 @@ is handed, `TileSchema` and its feature sets, the shared helpers a profile
 can (but doesn't have to) use, and how to write and distribute a profile of
 your own. This package ships no profiles: for two real ones, and what they
 compute, see
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)
 and its `land` and `cropped-waterways`, referred to throughout this document
 as worked examples. For the pipeline mechanics around a profile (fetching,
 sharding, publishing), see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -590,7 +590,7 @@ packaged or registered anywhere either: `--profile` is always a path to a
 standalone `.py` file, with no separate registration step. There is no
 "built-in vs. external" special-casing to be on the wrong side of, because
 there is no built-in side:
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)'
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)'
 `land.py`/`cropped_waterways.py` are loaded through exactly the path yours
 will be, including by this repo's own CI run. The file's one required
 export is a module-level `PROFILE` naming your `Profile` subclass (the
@@ -692,7 +692,7 @@ jobs:
         with: { name: my-profiles, path: my_profile.py }
   build:
     needs: profiles
-    uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@main
+    uses: tilelab/tilealchemist/.github/workflows/_pipeline.yml@main
     with:
       profile: ./my_profile.py
       profile_artifact: my-profiles
@@ -725,7 +725,7 @@ publishing stops there".
 `output_basename: land,cropped-waterways`, so several profiles can share
 one `prepare-shards` walk and one fetch per worker in a single run instead
 of each needing its own `_pipeline.yml` call; see
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)'
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)'
 own build workflow, which does exactly this. A single value behaves
 identically to calling it with just one profile, as shown above.)
 

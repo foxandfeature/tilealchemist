@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/foxandfeature/tilealchemist"
+Repository = "https://github.com/tilelab/tilealchemist"
 
 [project.scripts]
 tilealchemist-prepare-shards = "tilealchemist.prepare_shards:main"

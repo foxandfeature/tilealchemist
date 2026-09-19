@@ -1,10 +1,12 @@
 """The CPU-bound half of a worker; see docs/ARCHITECTURE.md "Parallelism"."""
 import collections
 import concurrent.futures
+import operator
 import sys
 
 from pmtiles.tile import tileid_to_zxy
 
+from tilealchemist.partition import partition_by_cost
 from tilealchemist.profiles import load_profile
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.tile import Tile
@@ -81,9 +83,10 @@ TRANSFORM_CHUNKS_PER_WORKER = 8
 def _chunk_entries(real_entries, transform_workers):
     if transform_workers <= 1 or len(real_entries) <= 1:
         return [real_entries]
-    target_count = max(1, len(real_entries) // (transform_workers * TRANSFORM_CHUNKS_PER_WORKER))
-    return [real_entries[start:start + target_count]
-            for start in range(0, len(real_entries), target_count)]
+    chunk_count = min(len(real_entries), transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
+    chunks = partition_by_cost(real_entries, chunk_count,
+                               atomic_key=operator.attrgetter("offset"))
+    return [chunk for chunk in chunks if chunk]
 
 
 def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):

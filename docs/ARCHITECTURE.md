@@ -4,7 +4,7 @@ How the pipeline works *around* a profile: resolving the source archive,
 fetching it, sharding the work across workers, and publishing the result.
 For what a profile actually computes, see
 [`docs/PROFILES.md`](PROFILES.md) (the system) and
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)
 (a worked example: the `land`/`cropped-waterways` layers).
 
 ## Source resolution
@@ -166,16 +166,16 @@ community-run server. Instead:
    (e.g. the same "all water" tile recurring across different oceans) lands
    in the same worker as the tile it's deduped against, instead of a random
    other worker re-fetching the same bytes. `partition.py`'s
-   `partition_evenly()` keeps a run of same-offset entries whole across
+   `partition_by_cost()` keeps a run of same-offset entries whole across
    worker boundaries, past a worker's target size, but only up to one whole
-   share of the run's records. That cap is not a detail: a Protomaps planet
-   build dedupes its open ocean into same-offset runs of hundreds of
-   thousands of entries (315K and 306K at z0..z11 alone, against a
-   128-worker share of 16K), and an unbounded rule drops every one of them
-   on a single worker however high `worker_count` goes, while starving the
-   workers after it. Splitting such a run costs only what keeping it whole
-   was buying — one tile's bytes re-fetched per extra worker — so the cap
-   is the cheap side of that trade.
+   share of the run's cost (see "Parallelism" for what that weighs). That
+   cap is not a detail: a Protomaps planet build dedupes its open ocean into
+   same-offset runs of hundreds of thousands of entries (315K and 306K at
+   z0..z11 alone, against a 128-worker share of 16K), and an unbounded rule
+   drops every one of them on a single worker however high `worker_count`
+   goes, while starving the workers after it. Splitting such a run costs
+   only what keeping it whole was buying — one tile's bytes re-fetched per
+   extra worker — so the cap is the cheap side of that trade.
 3. Each worker (`tilealchemist/build_shard.py` for the entry point,
    `shard_worker.py` for the run's flow, `fetch_batching.py` for splitting
    and fetching its manifest, `transform.py` for the CPU-bound transform,
@@ -269,30 +269,65 @@ encode, sqlite insert, all of them CPU-bound rather than network) fans out
 across a worker's own CPU cores via `--transform-workers` (default: all
 available cores; `1` disables pooling and runs everything in the worker
 process).
-`real_entries` is split into contiguous chunks sized by **entry count**,
+`real_entries` is split into contiguous chunks by `partition.py`'s
+`partition_by_cost()`, the same function that splits work across workers,
 deliberately producing several times more chunks than there are processes
 (`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter.
 
-Entry count is the right unit because decode is paid once per entry
-regardless of that entry's byte length or `run_length`; weighting by
-cumulative bytes or by output-tile count was tried in production and failed
-badly in opposite directions. Balancing on bytes let one real run hand a
+### What a record costs
+
+`cost.py` answers that, and `partition_by_cost()` splits on cumulative cost
+rather than on a record count. A record's cost has three axes, and no
+single one of them is the unit:
+
+- **Decode work**, which dominates. It is paid once per *distinct* entry —
+  a record repeating the previous one's `(offset, length)` is decoded zero
+  times, matching what `transform_batch_blob_multi()` actually does — and
+  it grows *faster* than that entry's byte length, because a bigger tile is
+  also a denser one: more features to decode, more geometry for a profile
+  to clip and union. `DENSITY_EXPONENT` is 1.5, fitted against a planet
+  run's 128 worker durations, where it lifts the model's R² from 0.67
+  (linear in bytes) to 0.77.
+- **Entry count**, which bounds decode calls and, with them, peak memory.
+- **`run_length`**, one sqlite insert per output tile per profile.
+
+Each axis is normalized to its own total across the run, then mixed by
+`AXIS_SHARES` (0.25 / 0.60 / 0.15). Normalizing first is what makes the mix
+safe: a worker can exceed its fair share of any one axis only by that
+axis's reciprocal share, so none can run away. That matters because
+weighting by a single axis was tried in production and failed badly in
+opposite directions. Balancing on bytes alone let one real run hand a
 worker 3.5M real entries against its peers' 500K-900K, a near-identical
 download size at ~5x the decode work, which ran that worker out of memory.
-Balancing on `run_length` (total output tiles) was worse: a handful of
-entries with a huge `run_length` "fills" a tile-sized target almost
-immediately while costing almost no decode work, so regions dense in those
-pushed every real, unique-content entry (`run_length` 1, one decode each,
-and just as many bytes to fetch) onto whatever workers were left, producing
-a 4.3M-entry/16GB worker next to a 76K-entry/7MB one. `partition.py`'s
-`partition_evenly()` applies the same rule when splitting work across
-workers in the first place.
+Balancing on `run_length` alone was worse: a handful of entries with a huge
+`run_length` "fills" a tile-sized target almost immediately while costing
+almost no decode work, so regions dense in those pushed every real,
+unique-content entry (`run_length` 1, one decode each, and just as many
+bytes to fetch) onto whatever workers were left, producing a
+4.3M-entry/16GB worker next to a 76K-entry/7MB one.
 
-But equal entry counts still don't mean equal cost: transform cost tracks
-tile content, not entry count, and a real run's four chunks of
-269648/269648/269648/269645 entries finished 2m17s, then a further 9m15s,
-then a further 17m9s apart (dense coastline vs. open ocean). That is why
-chunk count exceeds process count: it turns `ProcessPoolExecutor`'s own
+Counting records, the unit used before this, fails the other way: it is
+*exactly* even and says nothing about cost. In a 128-worker planet run it
+gave every worker 458K entries and between 32MB and 3,494MB of tile data,
+and those workers ran between 26s and 57m42s. Across all 128, job duration
+correlated with entry count at 0.04 and with byte volume at 0.82. Replaying
+that run's manifests through the cost weight puts the longest worker at a
+predicted 10m24s against 49m06s, holds the largest shard's entry count to
+1.46M -- well under the 3.5M that died -- and *lowers* peak blob memory
+from 3.49GB to 0.98GB.
+
+Since only ~20 jobs run concurrently anyway, balancing does not move the
+floor: 16 core-hours over 20 lanes is ~48 minutes either way. What it
+removes is the tail. That run spent its last 19 minutes at a concurrency of
+**one**, waiting on a single worker.
+
+### Why more chunks than processes
+
+Cost-balanced chunks still are not equal-cost chunks: the weight is an
+estimate, and tile content varies inside a chunk. A real run's four chunks
+of 269648/269648/269648/269645 entries finished 2m17s, then a further
+9m15s, then a further 17m9s apart (dense coastline vs. open ocean). That is
+why chunk count exceeds process count: it turns `ProcessPoolExecutor`'s own
 call queue into a work queue, where a process that finishes early pulls the
 next pending chunk instead of idling while one unlucky core grinds through
 a dense coastline. Balancing gets the chunks roughly even; over-chunking
@@ -300,6 +335,11 @@ absorbs whatever imbalance is left. `TRANSFORM_CHUNKS_PER_WORKER` is 8:
 enough to keep the idle tail at roughly an eighth of a process's share,
 while leaving per-chunk overhead (one profile reimport, one blob-slice
 pickle) noise against multi-minute chunks.
+
+Both together are what close the tail. The same planet run's worst worker
+split 452687 entries into 33 entry-count chunks of 0MB to 614MB, and spent
+its final 11 minutes running that one 614MB chunk on one of four cores.
+Weighted, the same manifest yields 32 chunks of 5MB to 107MB.
 
 Each task reloads its profiles from their own `--profile` paths rather than
 receiving live instances: profiles loaded via `load_profile()`'s
@@ -367,7 +407,7 @@ wildly uneven in size, so it pays for a queue to get timing history and
 longest-first ordering out of it. TileAlchemist slices its own shards out of
 the source archive on every run, so a shard has no identity that survives to
 the next run, nothing to accumulate history against, and no size skew left
-to schedule around: `partition.py`'s `partition_evenly()` has already
+to schedule around: `partition.py`'s `partition_by_cost()` has already
 balanced the cells before any of them start. A queue here would add
 coordination, shared state, and a failure mode, and buy nothing.
 
@@ -442,7 +482,7 @@ committed to the calling repo and only for that. `build-shards` doesn't need
 a repository, it needs one `.py` file; taking that file as an artifact means
 it can come from anywhere the calling workflow can produce one: another
 repository (this repo's own `test.yml` builds with
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)'
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)'
 profiles that way, having none of its own), a generator step, a downloaded
 release asset. It also replaces `worker_count` full checkouts with one
 upload and `worker_count` downloads of a file measured in kilobytes.
@@ -505,7 +545,7 @@ was split, instead of the reader having to work out the part names and
 
 Anything needing a credential of its own stays out of this repository, in
 the repo that owns that credential. The B2 mirror behind
-[tilealchemist-standardprofiles](https://github.com/foxandfeature/tilealchemist-standardprofiles)'
+[tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)'
 layers is a plain job in that repository's own build workflow, not a
 reusable workflow here, and that is a deliberate structural choice rather
 than tidiness.
@@ -528,7 +568,7 @@ Every `publish-*` job in a caller's workflow `needs:` the job that calls
 `_pipeline.yml`, the one real cross-job dependency; everything else flows
 through `inputs.*` or named artifacts. A third-party repo calls
 `_pipeline.yml` via
-`uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`,
+`uses: tilelab/tilealchemist/.github/workflows/_pipeline.yml@<ref>`,
 a native cross-repo capability of reusable workflows, no GitHub Marketplace
 listing required.
 

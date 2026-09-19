@@ -7,8 +7,8 @@ name: TileAlchemist pipeline (reusable)
 #
 # This workflow MUST publish nowhere: no GitHub Release, no B2 upload. That
 # is the calling workflow's job. Every caller is a separate repository (see
-# foxandfeature/tilealchemist-standardprofiles) calling this via
-# `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
+# tilelab/tilealchemist-standardprofiles) calling this via
+# `uses: tilelab/tilealchemist/.github/workflows/_pipeline.yml@<ref>`.
 #
 # Profiles arrive as an artifact the caller uploads, never from a checkout
 # done here. This pipeline has no opinion about which repository a profile
