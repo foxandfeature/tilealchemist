@@ -1,17 +1,9 @@
+"""Rate limiter for a worker's `update:` lines; see docs/ARCHITECTURE.md."""
 import threading
 import time
 
 
 class UpdateLineThrottle:
-    """Rate-limits a worker's `update:` lines to at most one per `interval`.
-
-    By default the first `due()` MUST wait out a full interval, so a step
-    that finishes sooner stays silent (docs/ARCHITECTURE.md, "Worker
-    logging"). `fire_immediately=True` makes the first call due instead, for
-    curl's progress-meter behavior: instant "yes, it's downloading"
-    feedback. throttle_progress.sh's show_pending_if_due() is the same
-    bypass in bash.
-    """
 
     def __init__(self, interval, fire_immediately=False):
         self.interval = interval

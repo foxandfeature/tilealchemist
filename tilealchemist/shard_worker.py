@@ -1,29 +1,4 @@
-"""One worker's shard build, driven by its already-parsed CLI args.
-
-Fetches its manifest's tile data, transforms it per profile, and writes each
-profile's shard file. `build_shard.py` owns argument parsing and the CLI
-docstring, and calls `run_worker(args)` with the result.
-
-    run_worker()
-      read_source_metadata()     manifest.py: source.json from prepare_shards.py
-      read_manifest()            manifest.py: this worker's entries
-      split_manifest_entries()   -> real entries / gap entries
-      init_mbtiles()             mbtiles.py: one connection per profile
-      real entries, one batch at a time (_process_real_entries):
-        plan_fetch_batches()       fetch_batching.py: one range GET per batch, split on wide gaps
-        fetch_batch_blob()         fetch_batching.py: that batch's bytes
-        run_transform()            transform.py: a chunk of tiles at a time
-        write_output_tiles()       mbtiles.py: that chunk, then drop it
-      gap entries (_process_gap_entries):
-        Profile.transform_gap()    one blob for every gap tile in the run
-        write_gap_tiles()          mbtiles.py: nothing to fetch
-      close_connections()
-
-Logging to stderr is two kinds of line. Major ones, phase transitions and
-the final summary, always print. Throttled `update: ...` ones exist only so
-a step taking a while does not look stuck. See docs/ARCHITECTURE.md "Worker
-logging" for both.
-"""
+"""One worker's shard build; see docs/ARCHITECTURE.md "Parallelism"."""
 import sys
 
 from tilealchemist.fetch_batching import fetch_batch_blob, plan_fetch_batches
@@ -41,10 +16,7 @@ from tilealchemist.transform import run_transform
 
 
 def split_manifest_entries(entries):
-    """Gap entries (compute_gaps() in partition.py) are tagged length=0,
-    there being nothing to fetch for them. The profile's transform_gap (see
-    profiles/base.py) is written at every (zoom, tile_column, tile_row) in
-    their run instead."""
+    # compute_gaps() tags a gap length=0, there being nothing to fetch for it.
     real_entries = [entry for entry in entries if entry.length > 0]
     gap_entries = [entry for entry in entries if entry.length == 0]
     return real_entries, gap_entries
@@ -52,8 +24,7 @@ def split_manifest_entries(entries):
 
 def run_worker(args):
     source = read_source_metadata(args.source)
-    # From the source, never a flag of this worker's own: no worker may
-    # disagree with the walk about how to read what it fetched.
+    # From the source, never a flag: no worker may disagree with the walk.
     schema = SCHEMAS[source.schema]
     profiles = [profile_class() for profile_class in args.profile_classes]
     print(f"source={source.url} (build {source.build}, schema {schema.name}), "
@@ -67,7 +38,6 @@ def run_worker(args):
     connections = [init_mbtiles(out, source.min_zoom, source.max_zoom, profile, schema)
                     for out, profile in zip(args.out, profiles)]
 
-    # Empty shard: nothing assigned to this worker at all.
     if not real_entries and not gap_entries:
         close_connections(connections)
         print(f"done: (empty shard) -> {', '.join(args.out)}", file=sys.stderr)
@@ -88,10 +58,6 @@ def run_worker(args):
 
 
 def _process_real_entries(real_entries, args, source, schema, profiles, connections, counts):
-    """One batch at a time, fetched once and transformed for every profile
-    against those same bytes (see run_transform() and
-    transform_batch_blob_multi()). There is usually exactly one batch; see
-    plan_fetch_batches() for what splits it."""
     batches = plan_fetch_batches(real_entries, args.max_fetch_gap)
     if len(batches) > 1:
         print(f"{len(real_entries)} real entries fetched in {len(batches)} range requests "
@@ -107,17 +73,12 @@ def _process_real_entries(real_entries, args, source, schema, profiles, connecti
             for profile_counts, profile_results, connection in zip(
                     counts, chunk_results, connections):
                 profile_counts.add(*write_output_tiles(profile_results, connection))
-        # MUST be dropped before the next batch is fetched. A worker cannot
-        # afford two batches' bytes in memory at once, for the same reason it
-        # writes each transformed chunk out and drops it
-        # (docs/ARCHITECTURE.md "Parallelism").
+        # A worker cannot afford two batches' bytes at once; drop before the next fetch.
         del blob
 
 
 def _process_gap_entries(gap_entries, schema, profiles, connections, counts):
-    """No fetch needed. One transform_gap() per profile covers every gap tile
-    in the run (see profiles/base.py), so the transform side of this phase is
-    the one call below."""
+    """No fetch: one transform_gap() per profile covers every gap tile in the run."""
     for profile_counts, profile, connection in zip(counts, profiles, connections):
         gap_data = profile.transform_gap(schema)
         profile_counts.add(*write_gap_tiles(gap_entries, connection, gap_data))

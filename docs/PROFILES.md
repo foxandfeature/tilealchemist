@@ -509,6 +509,80 @@ If a `side location conflict` ever does surface here, the fix is a fallback on
 the exception, not a pre-snap on every line: the snapped union is a different
 answer, not a safer route to the same one.
 
+**`make_valid()` repairs the union, it does not reshape it.** GEOS's buffer
+can pinch a narrow hole (a skerry) off the union's shell and emit the remnant
+as a duplicate element overlapping the body it came from, leaving the union
+invalid with `Nested shells`. `_compute_union()` repairs that there rather
+than at the cut, because an invalid union is undefined behaviour for every
+consumer. `method="structure"` is required: the default `"linework"` splits
+the overlap instead of merging it, leaving a phantom island where the
+duplicate was — the artefact class `WATER_GAP_CLOSING_BUFFER` exists to
+prevent. `"structure"` merges it, measurably identical to unioning the parts
+with each other, and `keep_collapsed=False` keeps the result polygonal so no
+caller is handed a line where it expects an area. This is why `pyproject.toml`
+pins `shapely>=2.1`, the first release with `make_valid(method=...)`.
+
+### What the schemas declare, and where those values came from
+
+The two schemas this repository ships differ in more than layer names, and
+the constants in `schemas.py` are measurements rather than preferences. They
+are recorded here because nothing in the code can show where they came from.
+
+`OpenMapTilesSchema` has one `water` polygon layer, one `waterway` line
+layer, and tunnel/bridge/ford classification in one string attribute,
+`brunnel`. Its `default_buffer_pixels = 4` is Planetiler's own default
+(`defaultBufferPixels` in `FeatureCollector`), which OpenMapTiles leaves
+unchanged for `water`/`waterway` (`BUFFER_SIZE` in
+`OpenMapTilesSchema.java`). Label layers override it much wider — `place`
+uses 256 — which is why the name says *default*. Its `WATERWAYS` fields
+follow the [OpenMapTiles schema docs](https://openmaptiles.org/schema/#waterway).
+
+`ProtomapsSchema` (basemap v4) has no waterway layer at all. Water polygons,
+waterway lines and water label points share one `water` layer, told apart by
+the geometry type `mapbox_vector_tile.decode()` writes into each feature's
+geometry dict — the same way Protomaps' own styles read it, their water fill
+layer filtering `["==", "$type", "Polygon"]`. Its `default_buffer_pixels = 8`
+is the wider of the schema's two: `Water.java`/`Earth.java` call
+`setBufferPixels(8)` on water polygons and on `earth`, while water *lines*
+keep Planetiler's default 4, and a profile reasoning about tile edges has to
+cover the polygons reaching the full 8. Confirmed against build 20260908 at
+extent 4096: polygons run to -128..4224, lines to -64..4160.
+
+Its `SURFACE_WATER` method filters out no `kind` — ocean, lake, playa, reef —
+because Protomaps' own style paints them all as water. `tunnel` is encoded
+only from z14 (`extraAttrMinzoom` in `Water.java`), so below that zoom no
+polygon declares itself one. Its `WATERWAYS` fields are what Protomaps sets
+on a water *line*; the localized `name:<lang>`, `name2` and `script` variants
+ride along on the features themselves, and `kind_detail`, `bridge` and
+`tunnel` are polygon-only in this basemap.
+
+Both schemas set `default_extent = 4096`, what every Planetiler-produced tile
+encodes its layers at. It is consulted only for a tile with no layer to read
+an extent from: a gap tile, or a real tile whose layers all came back empty.
+
+`SCHEMAS` stays a hardcoded dict, mirroring `sources/__init__.py`'s
+`SOURCES`. Another schema is one `TileSchema` subclass instance, one
+`SchemaName` member and one entry there, with no other code changes.
+
+### Adding a feature set
+
+`features.py` is the one place a feature set's meaning is written down, and
+both sides honour it. Adding one for a domain no schema covers yet
+(buildings, landuse, POIs) means an entry there plus a `@feature` method on
+the schemas that can answer it — never a change to `TileSchema` or `Profile`.
+
+A `FeatureSet` is a name plus what that name *means*, and stays tied to no
+schema. `WATERWAYS` says "waterway line features"; every schema able to
+answer that declares a `@feature(WATERWAYS)` method, however its own layers
+are structured. Identity is object identity, so a schema's `provides` mapping
+and a `Tile`'s memo keys use it directly: two feature sets sharing a name are
+still two feature sets.
+
+The raw `{"geometry": ..., "properties": ...}` dicts belong to
+`mapbox_vector_tile` and stay at its decoder/encoder boundaries. A `@feature`
+method returns them as decoded; `Tile.features()` converts to `Feature`, and
+`Profile._encode_tile()` converts back. Profile code never deals in them.
+
 ## Writing and distributing your own profile
 
 A profile doesn't live in this repository at all, and doesn't need to be
@@ -557,6 +631,16 @@ a `pyproject.toml` or a `requirements.txt`:
 """My profile: ..."""
 from tilealchemist.profiles.base import Profile
 ```
+
+`tilealchemist-profile-requirements` reads that block **without importing the
+profile**, which is the point of using PEP 723 rather than a module-level
+list: the dependencies have to be installed *before* the profile can be
+imported at all, so anything that executed the file first would be useless.
+It reports a malformed block as a usage error rather than a traceback,
+because it runs as one step of a CI install script where the useful output is
+which profile is broken and why. An unclosed block is reported rather than
+treated as "no dependencies": a profile with one would install none of what
+it needs, then fail on the very import the block exists to make possible.
 
 That keeps a profile what `load_profile()` already treats it as: one
 self-contained file, with nothing to distribute or keep in sync alongside

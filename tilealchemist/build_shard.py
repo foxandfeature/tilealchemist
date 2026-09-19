@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""One worker's shard of a profile's output layer.
-
-docs/ARCHITECTURE.md "Fetching" and "Parallelism" say what this does and
-why; docs/PROFILES.md says what a --profile computes per tile.
-
-This file is the entry point only: argument parsing, then handing off. The
-worker run itself lives in `tilealchemist/shard_worker.py`, whose docstring
-has the phase-by-phase flow. The two halves it drives are
-`tilealchemist/transform.py` (fetched bytes -> each profile's output tiles)
-and `tilealchemist/mbtiles.py` (those tiles -> one shard file per profile).
-
-Logging to stderr is two kinds of line. Major ones, phase transitions and
-the final summary, always print. Throttled `update: ...` ones exist only so
-a step taking a while does not look stuck. See docs/ARCHITECTURE.md "Worker
-logging" for both, and --report-interval / --download-report-interval below
-for the intervals.
-
-    tilealchemist-build-shard --worker-index 0 --profile ./my_profile.py \
-        --manifest manifests/worker-000.bin --source manifests/source.json \
-        --out my-profile-shard-0.mbtiles
-
-    tilealchemist-build-shard --worker-index 0 \
-        --profile ./my_profile.py,./other_profile.py \
-        --manifest manifests/worker-000.bin --source manifests/source.json \
-        --out my-profile-shard-0.mbtiles,other-profile-shard-0.mbtiles
-"""
+"""CLI entry point for one worker; the run itself is in shard_worker.py."""
 import argparse
 import os
 
@@ -33,16 +8,28 @@ from tilealchemist.profiles import load_profile
 from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
 
+HELP = """One worker's shard of a profile's output layer.
 
-# Default for --download-report-interval. Its own flag, and shorter than the
-# transform's, because the download phase it covers is itself shorter. See
-# docs/ARCHITECTURE.md "Worker logging".
+docs/ARCHITECTURE.md "Fetching" and "Parallelism" say what this does and why;
+docs/PROFILES.md says what a --profile computes per tile.
+
+    tilealchemist-build-shard --worker-index 0 --profile ./my_profile.py \\
+        --manifest manifests/worker-000.bin --source manifests/source.json \\
+        --out my-profile-shard-0.mbtiles
+
+    tilealchemist-build-shard --worker-index 0 \\
+        --profile ./my_profile.py,./other_profile.py \\
+        --manifest manifests/worker-000.bin --source manifests/source.json \\
+        --out my-profile-shard-0.mbtiles,other-profile-shard-0.mbtiles
+"""
+
+# Shorter than --report-interval because the download phase it covers is shorter.
 DEFAULT_DOWNLOAD_REPORT_INTERVAL = 15.0
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--worker-index", type=int, required=True)
     parser.add_argument("--manifest", required=True,
                          help="this worker's manifest file from prepare_shards.py")

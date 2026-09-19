@@ -1,3 +1,4 @@
+"""Retry delay for a throttled or failed ranged request."""
 import random
 
 
@@ -14,8 +15,7 @@ def _server_requested_delay(response):
 
 
 def _jittered_backoff(attempt, base_delay):
-    # Jitter breaks lockstep. Workers throttled in the same burst would
-    # otherwise retry together and reproduce it.
+    # Jitter breaks the lockstep that would reproduce the throttling burst.
     return base_delay * (2 ** (attempt - 1)) * random.uniform(1.0, 1.5)
 
 

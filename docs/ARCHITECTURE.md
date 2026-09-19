@@ -531,3 +531,176 @@ through `inputs.*` or named artifacts. A third-party repo calls
 `uses: foxandfeature/tilealchemist/.github/workflows/_pipeline.yml@<ref>`,
 a native cross-repo capability of reusable workflows, no GitHub Marketplace
 listing required.
+
+## Module invariants
+
+Facts the code depends on that the code itself cannot state. They lived in
+comments before [`COMMENT_STYLE.md`](COMMENT_STYLE.md) moved them here; each
+is a constraint an edit could break silently, so change the code and this
+section together.
+
+### Phase maps
+
+`prepare-shards`, driven by `shard_prep.run_prepare()`:
+
+    run_prepare()
+      resolve_source()                sources/: which archive to read
+      make_session()                  ranged_fetch.py: shared by every fetch
+      collect_entries()               pmtiles_index.py: header + index in 2 requests
+      fetch_declared_attribution()    attribution.py: what the archive credits
+      compose_attribution()           attribution.py: what this layer credits
+      compute_gaps()                  partition.py: tile_ids no entry covers
+      partition_into_worker_blocks()  partition.py: each worker's share
+      write_worker_manifests()        manifest.py: worker-NNN.bin
+      write_source_metadata()         manifest.py: source.json, shared
+
+`build-shard`, driven by `shard_worker.run_worker()`:
+
+    run_worker()
+      read_source_metadata()     manifest.py: source.json from prepare-shards
+      read_manifest()            manifest.py: this worker's entries
+      split_manifest_entries()   -> real entries / gap entries
+      init_mbtiles()             mbtiles.py: one connection per profile
+      real entries (_process_real_entries), one batch at a time:
+        plan_fetch_batches()       fetch_batching.py: one range GET per batch
+        fetch_batch_blob()         fetch_batching.py: that batch's bytes
+        run_transform()            transform.py: a chunk of tiles at a time
+        write_output_tiles()       mbtiles.py: that chunk, then drop it
+      gap entries (_process_gap_entries):
+        Profile.transform_gap()    one blob for every gap tile in the run
+        write_gap_tiles()          mbtiles.py: nothing to fetch
+      close_connections()
+
+### Zoom levels (`zoom.py`)
+
+A zoom is a `ZoomLevel` member everywhere the pipeline passes one around, so
+a level outside the set raises `ValueError` where it enters rather than
+walking to nothing. `IntEnum`, because a zoom level *is* a number wherever
+the pipeline computes with it — `zxy_to_tileid(max_zoom + 1, ...)`, the
+`min_zoom <= zoom <= max_zoom` filter, the `2 ** zoom` row flip.
+
+`MAX_SUPPORTED_ZOOM = 30` is a hard ceiling, not a preference:
+`zxy_to_tileid()` raises `OverflowError` above z31 because `tile_id` stops
+fitting a 64-bit int, and `tile_id_bounds()` always asks it for
+`max_zoom + 1`. The members are generated through the functional API with
+`module=`/`qualname=` set, which is what makes them picklable — `ChunkJob`
+carries one into a transform pool worker.
+
+### The manifest format (`manifest.py`)
+
+One file per worker, a flat sequence of fixed-size records, no framing: file
+size / `RECORD.size` gives the count.
+
+    tile_id: uint64, offset: uint64, length: uint32, run_length: uint32
+
+These mirror a PMTiles directory entry. `source.json` carries what is true
+for the whole run, and its JSON key strings stay confined to
+`as_json()`/`from_json()`: every other reader names a field, so a renamed or
+missing key is a mistake at the two ends of the file format rather than a
+`KeyError` wherever a worker happens to look something up.
+
+### Tiles carry no coordinate (`tile.py`)
+
+Everything on a `Tile` is tile-local, hence identical for every z/x/y that
+dedupes to the same bytes. Three things rest on that invariant: one object
+standing for a whole `run_length` run; one standing for two entries pointing
+at the same `(offset, length)`, which offset-ordered batching makes adjacent;
+and one `Tile.empty()` serving a hundred-thousand-tile gap region.
+
+`extent` reads the first layer's. MVT allows one extent per layer, but a tile
+in practice encodes every layer at the same one, and a tile with no layers
+falls back to the schema's `default_extent`.
+
+### Encoding (`mvt.py`, `mbtiles.py`)
+
+`gzip.compress(..., mtime=0)` is required, not tidiness. Without it gzip
+embeds the current time, so byte-identical tile content — every gap tile, in
+particular — compresses differently across worker processes and defeats
+PMTiles' content-hash dedup in the final merge.
+
+mbtiles numbers rows TMS-style while a PMTiles tile ID decodes to XYZ, so
+every write flips the row (`(2 ** zoom - 1) - tile_row`).
+`write_gap_tiles()`'s `tms_rows()` must stay a generator: a worker holding a
+million-tile gap (an ocean, an ice sheet interior) would otherwise
+materialize them all as one list before handing them to sqlite3.
+
+### The directory walk (`pmtiles_index.py`)
+
+`leaf_window_for()` must prune by exactly the rule `walk_directory_tree()`
+descends by. The two are kept in step by hand, because the walk pays that
+rule per entry over a planet's worth of directories while the window pays it
+over the root's few thousand. Leaf directories sit in the file in
+root-pointer order, so the ones the walk reaches run from the first match to
+the last; an archive ordering them otherwise trips `LeafWindow.node_bytes()`'s
+bounds check, which is all that stands between an unexpected layout and a
+silently short slice decoding into plausible-looking garbage.
+
+`tile_id_bounds()` is derived in one place because the walk prunes against
+those bounds and `compute_gaps()` fills the untouched stretches between
+entries — the two must agree exactly.
+
+`WalkProgress`'s percentage divides by the leaf window's length, which is an
+upper bound: tile_id pruning lets the walk finish without decoding the whole
+window, so the percentage can stop short of 100%.
+
+### Retries (`ranged_fetch.py`)
+
+Retries cover the transient ways a CDN fails under a cold-cache stampede,
+many concurrent workers hitting a freshly-published archive at once. Three
+shapes, none of them permanent:
+
+- a 200 instead of a 206 — the server ignored the `Range` header, and reading
+  the response in full would be tens of GB;
+- a 429/5xx — rate-limiting, or buckling under the burst;
+- the connection dropping mid-stream, seen as an `IncompleteRead` well past
+  the halfway point of a large batch. There is no response left to read a
+  `Retry-After` from, so the backoff runs on jitter alone.
+
+`on_chunk(bytes_so_far)` receives the running total for the *current*
+attempt, not a delta, so a retry that restarts the transfer rewinds the
+progress line instead of counting the re-sent bytes twice.
+`_warn_retry()` emits a `::warning` workflow command as the retry happens, so
+a stampede surfaces in the Actions UI and not only in the job log.
+
+### Batching and chunking (`fetch_batching.py`, `transform.py`)
+
+Entries arrive sorted by offset, but sorted is not adjacent: dedup points an
+entry at whatever tile first held its bytes, so two neighbours can sit
+gigabytes apart with data this run never reads in between. One GET across
+such a hole would download all of it, so the manifest is split at every hole
+wider than `--max-fetch-gap`. Two entries at the same offset are zero apart
+and must not be split. The 8 MB default is where one request still beats two:
+a few MB of unread bytes on an open, streaming connection cost less than
+another round trip against a cold CDN.
+
+`_chunk_entries()` must keep chunks contiguous and in order.
+`_blob_slice_for_chunk()` slices one byte range per chunk, and
+`transform_batch_blob_multi()`'s dedup compares only against the previous
+entry, so a duplicate pair split across a chunk boundary misses that one
+dedup — harmlessly, but only because the chunks are contiguous.
+
+`_transform_chunk()` rebuilds two things that cannot cross a process
+boundary: the profiles, which the pickler cannot reconstruct in a worker at
+all, reimported once per chunk rather than per tile; and its
+`TransformProgress`, which holds a `threading.Lock`. Only that object is
+unpicklable, not the reporting — the interval is a plain float, so a worker
+throttles its own lines over its own chunk while the parent's "chunk N done"
+lines carry the whole-shard view. The schema crosses as its `SchemaName`, and
+the child looks the same singleton up out of `SCHEMAS`.
+
+In `_pooled_chunk_results()`, `pending.pop(future)` must pop rather than
+index. A `Future` keeps the result it was handed for as long as the `Future`
+itself is alive, so holding every entry until the pool shuts down would pin
+every chunk's output for the whole transform phase — exactly the memory
+`run_transform()` yields per chunk to avoid.
+
+### Profiles and gaps
+
+`load_profile()` deliberately does not register the module in `sys.modules`.
+Transform pool workers reload profiles by path, which works under both fork
+and spawn; registering would only help under fork.
+
+`compute_gaps()` tags a gap record `length=0`, the sentinel
+`split_manifest_entries()` tells a gap by, there being nothing to fetch.
+`GAP_CHUNK_SIZE` caps one such record so that a single huge unbroken gap — a
+whole ice sheet's interior — cannot land entirely on one worker.

@@ -1,9 +1,4 @@
-"""Source registry: CLI-facing `--source` name -> `Source` class.
-
-Sources are not a plugin surface, so a plain dict of this repo's built-ins
-is the whole registry. Profiles differ: load_profile() resolves each one
-from its .py path, with no dict at all.
-"""
+"""Source registry: CLI-facing `--source` name -> `Source` class."""
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.sources.openfreemap import OpenFreeMapSource
 from tilealchemist.sources.protomaps import ProtomapsSource
@@ -17,12 +12,7 @@ SOURCES = {
 
 
 def resolve_source(source_name, source_url, schema=None):
-    """The `Source` these CLI arguments name, not yet resolved.
-
-    `schema` is the `--schema` value (a `SchemaName`, argparse having
-    rejected anything else) or None. It belongs to static-url alone. Every
-    other source declares its own, and a contradicting `--schema` MUST be
-    refused rather than ignored."""
+    """The `Source` these CLI arguments name, not yet resolved."""
     if source_name == "static-url":
         if not source_url:
             raise ValueError("--source-url is required when --source static-url")
@@ -33,6 +23,7 @@ def resolve_source(source_name, source_url, schema=None):
         return StaticUrlSource(source_url, SCHEMAS[schema])
 
     source = SOURCES[source_name]()
+    # A contradicting --schema is refused rather than ignored.
     if schema is not None and schema != source.schema.name:
         raise ValueError(f"--source {source_name} publishes {source.schema.name} tiles, so "
                          f"--schema {schema} cannot be right; leave --schema off "

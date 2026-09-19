@@ -1,8 +1,4 @@
-"""OpenFreeMap's planet PMTiles archive.
-
-A directory of timestamped builds, not all fully published, so the latest
-usable one MUST be picked at runtime rather than hardcoded.
-"""
+"""OpenFreeMap's planet PMTiles archive; see docs/ARCHITECTURE.md."""
 import re
 
 import requests
@@ -19,8 +15,6 @@ class OpenFreeMapSource(Source):
     schema = OPENMAPTILES
 
     def resolve(self):
-        """See README.md ("Method") for why `done` + tiles.pmtiles, not just
-        the newest directory listed."""
         response = requests.get(FILES_URL, timeout=30)
         response.raise_for_status()
 
@@ -30,6 +24,7 @@ class OpenFreeMapSource(Source):
             if match:
                 by_timestamp.setdefault(match.group(1), set()).add(match.group(2))
 
+        # The newest directory listed is not necessarily finished converting.
         ready = [timestamp for timestamp, files in by_timestamp.items()
                  if "done" in files and "tiles.pmtiles" in files]
         if not ready:

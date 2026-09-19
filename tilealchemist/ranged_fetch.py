@@ -1,13 +1,4 @@
-"""HTTP Range fetching against the source PMTiles archive.
-
-Shared by the only two things that talk to it: `pmtiles_index.py` (header
-and directory index, on the prepare-shards side) and `fetch_batching.py` (a
-worker's batch of tile data).
-
-The two call sites differ only in what their progress line says and how
-retry warnings name them, so those are parameters:
-`DownloadProgress(label=...)` and `retry_label`.
-"""
+"""HTTP Range fetching against the source PMTiles archive."""
 import sys
 import time
 
@@ -16,12 +7,7 @@ import requests
 from tilealchemist.backoff import backoff_delay
 from tilealchemist.throttle import UpdateLineThrottle
 
-# Retries cover the transient ways the CDN fails under a cold-cache
-# stampede, many concurrent workers hitting a freshly-published archive at
-# once. Three shapes: a 200 instead of a 206 (the server ignored the Range
-# header, and reading the response in full would be tens of GB), a 429/5xx
-# (rate-limiting, or buckling under the burst), and the connection dropping
-# mid-stream. None is permanent, so all are worth a few backed-off retries.
+# Covers the transient CDN failures of a cold-cache stampede; see docs/ARCHITECTURE.md.
 MAX_RANGE_ATTEMPTS = 6
 RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -37,16 +23,6 @@ def make_session():
 
 
 class DownloadProgress:
-    """Throttled `update: ...` progress lines for one ranged download.
-
-    `label` names what is being fetched ("directory index", "tile data").
-    Both call sites feed this from the single `iter_content` loop below, so
-    nothing here needs to be thread-safe.
-
-    `update` takes the bytes received so far in the current attempt, not a
-    delta. A retry that restarts the transfer then rewinds the line, instead
-    of counting the re-sent bytes twice and running past 100%.
-    """
 
     def __init__(self, total_bytes, interval, label):
         self.total_bytes = total_bytes
@@ -54,6 +30,7 @@ class DownloadProgress:
         self.throttle = UpdateLineThrottle(interval, fire_immediately=True)
 
     def update(self, downloaded):
+        """`downloaded` is the attempt's running total, so a retry rewinds rather than doubles."""
         if not self.throttle.due():
             return
         percent = (100 * downloaded / self.total_bytes) if self.total_bytes else 100.0
@@ -63,12 +40,6 @@ class DownloadProgress:
 
 
 class _RetryableFailure(Exception):
-    """One attempt failed in a way worth another try.
-
-    `detail` names it in the retry warning. `response` may carry a
-    Retry-After header, and is None when the connection broke with no
-    response left to read one from. `final` is raised in its place once the
-    attempts run out."""
 
     def __init__(self, detail, response, final):
         super().__init__(detail)
@@ -78,11 +49,7 @@ class _RetryableFailure(Exception):
 
 
 def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size):
-    """The response body for `range_header`, or `_RetryableFailure` for the
-    transient ways this fails.
-
-    Leaving the `with` while that propagates closes the response, so the
-    connection is back in the pool before the caller's backoff sleeps."""
+    # Leaving the `with` on a raise returns the connection before the caller's backoff sleeps.
     with session.get(url, headers={"Range": range_header}, timeout=READ_TIMEOUT,
                      stream=True) as response:
         status = response.status_code
@@ -116,18 +83,13 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size):
             return b"".join(chunks)
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError) as error:
-            # Seen as an IncompleteRead well past the halfway point on a
-            # large batch. The connection is already gone, so there is no
-            # Retry-After to honour and the backoff runs on jitter alone.
+            # No response left to read a Retry-After from, so the backoff runs on jitter alone.
             raise _RetryableFailure(
                 f"connection dropped after {downloaded} bytes "
                 f"({error.__class__.__name__})", None, error) from error
 
 
 def _warn_retry(retry_label, detail, attempt, delay):
-    """A workflow command emitted as the retry happens, so a cold-cache
-    stampede surfaces in the Actions UI and not only in the job log.
-    `retry_label` names the call site that hit it."""
     print(f"::warning title={retry_label} retry::{detail} "
           f"(attempt {attempt}/{MAX_RANGE_ATTEMPTS}), retrying in {delay:.0f}s",
           file=sys.stderr)
@@ -135,16 +97,6 @@ def _warn_retry(retry_label, detail, attempt, delay):
 
 def fetch_range(session, url, offset, length, retry_label,
                 on_chunk=None, chunk_size=1024 * 1024):
-    """`length` bytes of `url` starting at `offset`, retried per
-    MAX_RANGE_ATTEMPTS. Owning the loop, this also owns when to stop: the
-    last attempt re-raises the underlying failure instead of backing off.
-
-    `on_chunk(bytes_so_far)` is called per received chunk with the running
-    total for the current attempt. A retry restarts the transfer, so that
-    total restarts at zero too -- the count tracks what has actually
-    arrived rather than growing past the requested length.
-    `retry_label` names this call site in the retry warnings.
-    """
     range_header = f"bytes={offset}-{offset + length - 1}"
     for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
         try:
