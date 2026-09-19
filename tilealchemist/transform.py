@@ -212,7 +212,14 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
     then the work queue, handing each pending chunk to whichever process
     returns first — the mechanism TRANSFORM_CHUNKS_PER_WORKER's spare chunks
     exist for. Yielding on completion, rather than returning a list, lets
-    shard_worker.py drop each chunk as it goes; see run_transform()."""
+    shard_worker.py drop each chunk as it goes; see run_transform().
+
+    Dropping it takes both holders letting go. A `Future` keeps the result
+    it was handed for as long as the `Future` itself is alive, so `pending`
+    MUST give up its entry as that chunk is yielded: holding all of them
+    until the pool shuts down would pin every chunk's output for the whole
+    transform phase, which is the memory run_transform() yields per chunk to
+    avoid in the first place."""
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         pending = {}
         for index, chunk in enumerate(chunks):
@@ -221,7 +228,7 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
                                       chunk, index)
             pending[future] = (index, len(chunk), len(blob_slice))
         for future in concurrent.futures.as_completed(pending):
-            index, entry_count, byte_count = pending[future]
+            index, entry_count, byte_count = pending.pop(future)
             yield index, entry_count, byte_count, future.result()
 
 

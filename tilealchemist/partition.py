@@ -11,8 +11,8 @@ in offset order, and why gaps exist at all.
 
     partition_into_worker_blocks()   each worker's real + gap share
       partition_evenly()             by record count, twice: real entries
-                                     keeping same-offset runs whole, then
-                                     gap records cut exactly
+        _atomic_groups()             keeping same-offset runs whole up to
+                                     one share, then gap records cut exactly
 """
 import itertools
 import operator
@@ -67,6 +67,39 @@ def _share_end(record_count, worker_index, worker_count):
     return record_count * (worker_index + 1) // worker_count
 
 
+def _even_share(record_count, worker_count):
+    """The largest block an even split produces, and so the most records one
+    atomic group may carry on its own; see _atomic_groups()."""
+    return max(1, -(-record_count // worker_count))
+
+
+def _atomic_groups(records, atomic_key, share_limit):
+    """Yields `records` in the contiguous runs partition_evenly() MUST NOT
+    cut, none of them longer than `share_limit`.
+
+    A run longer than one whole share is cut into share-sized pieces, which
+    costs only what keeping it whole was buying: the duplicate bytes behind
+    it are fetched once per piece instead of once (docs/ARCHITECTURE.md,
+    "Fetching", step 2). That is one tile's bytes per extra worker. Keeping
+    such a run whole costs the opposite way, and unboundedly: a planet
+    build's "all water" run is millions of entries, every one of which lands
+    on a single worker no matter how high `worker_count` goes.
+
+    A generator, not a list, because the only caller walks it once and in
+    order. A planet run reaches here with ~58M entries, nearly all of them
+    at a distinct offset and so in a group of their own, and holding that
+    many one-record lists at once costs about 4 GB on a 16 GB runner that
+    is already carrying the entries themselves."""
+    if atomic_key is None:
+        for record in records:
+            yield [record]
+        return
+    for _key, group in itertools.groupby(records, key=atomic_key):
+        run = list(group)
+        for start in range(0, len(run), share_limit):
+            yield run[start:start + share_limit]
+
+
 def partition_evenly(records, worker_count, atomic_key=None):
     """Splits `records` into `worker_count` blocks of about
     record_count/worker_count *records* each.
@@ -75,22 +108,24 @@ def partition_evenly(records, worker_count, atomic_key=None):
     both failed in production (docs/ARCHITECTURE.md, "Parallelism").
 
     `atomic_key` names what MUST NOT be cut in two. Real entries pass
-    `offset`, keeping a same-offset run whole even past a worker's target
-    size (hence "about"). Gaps pass nothing and are cut exactly: their shared
-    sentinel offset=0 is no reason to land in one block."""
-    if atomic_key is None:
-        groups = [[record] for record in records]
-    else:
-        groups = [list(run) for _key, run in itertools.groupby(records, key=atomic_key)]
+    `offset`, keeping a same-offset run whole up to one worker's share, past
+    which _atomic_groups() cuts it. Gaps pass nothing and are cut exactly:
+    their shared sentinel offset=0 is no reason to land in one block.
+
+    A group can still carry the current worker past more than one share end
+    — its share is a target, not a cap. Advancing MUST then skip every
+    worker that group already covered, or each of them would be handed the
+    next single group and nothing else, however small."""
     record_count = len(records)
+    groups = _atomic_groups(records, atomic_key, _even_share(record_count, worker_count))
     blocks = [[] for _ in range(worker_count)]
     worker_index = 0
     assigned_count = 0
     for group in groups:
         blocks[worker_index].extend(group)
         assigned_count += len(group)
-        share_end = _share_end(record_count, worker_index, worker_count)
-        if assigned_count >= share_end and worker_index < worker_count - 1:
+        while (worker_index < worker_count - 1
+               and assigned_count >= _share_end(record_count, worker_index, worker_count)):
             worker_index += 1
     return blocks
 

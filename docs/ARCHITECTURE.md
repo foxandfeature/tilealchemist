@@ -166,8 +166,16 @@ community-run server. Instead:
    (e.g. the same "all water" tile recurring across different oceans) lands
    in the same worker as the tile it's deduped against, instead of a random
    other worker re-fetching the same bytes. `partition.py`'s
-   `partition_evenly()` never splits a run of same-offset entries across
-   two workers, even past a worker's target size.
+   `partition_evenly()` keeps a run of same-offset entries whole across
+   worker boundaries, past a worker's target size, but only up to one whole
+   share of the run's records. That cap is not a detail: a Protomaps planet
+   build dedupes its open ocean into same-offset runs of hundreds of
+   thousands of entries (315K and 306K at z0..z11 alone, against a
+   128-worker share of 16K), and an unbounded rule drops every one of them
+   on a single worker however high `worker_count` goes, while starving the
+   workers after it. Splitting such a run costs only what keeping it whole
+   was buying — one tile's bytes re-fetched per extra worker — so the cap
+   is the cheap side of that trade.
 3. Each worker (`tilealchemist/build_shard.py` for the entry point,
    `shard_worker.py` for the run's flow, `fetch_batching.py` for splitting
    and fetching its manifest, `transform.py` for the CPU-bound transform,
@@ -312,6 +320,16 @@ transformed output in memory for the whole transform phase, which is
 exactly what ran a worker out of memory in production. This way peak memory
 is bounded by how many chunks are in flight at once, not by the shard's
 total size.
+
+Yielding per chunk only bounds it if nothing else is still holding the
+chunks already yielded, and on the pooled path the `Future` each chunk came
+back on is such a holder: a `Future` keeps its result for as long as the
+`Future` is alive. `_pooled_chunk_results()` therefore drops each one from
+its `pending` map as it yields that chunk, rather than keeping the whole map
+until the pool shuts down. Keeping the whole map pinned every chunk's
+output for the whole phase, putting the bound straight back where it was
+before chunking — a planet run's two largest shards died to exactly that,
+on runners that report it as `The runner has received a shutdown signal`.
 
 ### Worker independence
 
